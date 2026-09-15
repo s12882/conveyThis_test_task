@@ -1,0 +1,11 @@
+.git
+.idea
+node_modules
+vendor
+public/build
+storage/logs/*.log
+storage/framework/cache/*
+storage/framework/sessions/*
+storage/framework/views/*
+database/database.sqlite
+.env
