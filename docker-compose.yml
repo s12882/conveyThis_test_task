@@ -61,6 +61,21 @@ services:
       retries: 10
     networks: [conveythis]
 
+  clamav:
+    image: clamav/clamav:1.5
+    container_name: conveythis-clamav
+    volumes:
+      - clamav-db:/var/lib/clamav
+    ports:
+      - "3310:3310"
+    healthcheck:
+      test: ["CMD-SHELL", "clamdcheck.sh"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 600s
+    networks: [conveythis]
+
   queue-worker:
     build:
       context: .
@@ -72,6 +87,8 @@ services:
     env_file: .env
     depends_on:
       mysql:
+        condition: service_healthy
+      clamav:
         condition: service_healthy
     networks: [conveythis]
 
@@ -95,3 +112,4 @@ networks:
 
 volumes:
   mysql-data:
+  clamav-db:
