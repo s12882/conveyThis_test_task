@@ -46,6 +46,8 @@ Delayed TTL job (fires ~24h later) ------------+        |
                                    rabbitmq-consumer command -> Mailable (log driver)
 ```
 
+A third independent concern feeds the same shared deletion path: **virus/macro scanning**. Every upload is queued (immediately, no delay) for a scan job on the same database queue as the TTL job. `clean` just updates the row; `infected` calls `FileDeletionService` with `deletion_reason = 'infected'` — so an infected upload is deleted and triggers the exact same RabbitMQ notification as any other deletion, no new notification plumbing needed. See `SESSION_LOG.md` (2026-09-15, "Upload edge-case analysis") and `~/.claude/plans/before-starting-implementation-i-nested-lerdorf.md` for the full analysis and reasoning (why async scanning is safe to use here specifically: decision 6 already rules out any download/preview feature, so there's no window where a not-yet-scanned file is exposed).
+
 ### Docker Compose services
 
 1. `app` — PHP-FPM + nginx, serves the web app
@@ -54,7 +56,8 @@ Delayed TTL job (fires ~24h later) ------------+        |
 4. `queue-worker` — same app image, `php artisan queue:work database`
 5. `rabbitmq-consumer` — same app image, custom Artisan command consuming the deletion queue
 6. `scheduler` — same app image, `php artisan schedule:work`
-7. Frontend assets (Bootstrap/jQuery + Vite) built at image build time, not a running service
+7. `clamav` — official `clamav/clamav` image, running `clamd`; persistent volume for the signature DB
+8. Frontend assets (Bootstrap/jQuery + Vite) built at image build time, not a running service
 
 ## 4. Data model
 
@@ -66,13 +69,15 @@ Delayed TTL job (fires ~24h later) ------------+        |
 - `mime_type` (string)
 - `size_bytes` (unsigned int)
 - `expires_at` (timestamp, `created_at` + 24h)
-- `deletion_reason` (nullable enum/string: `manual`, `ttl_expired`, `ttl_safety_net`)
+- `deletion_reason` (nullable enum/string: `manual`, `ttl_expired`, `ttl_safety_net`, `infected`)
+- `scan_status` (enum/string: `pending`, `clean`, `infected`, `error` — default `pending`)
+- `scanned_at` (nullable timestamp)
 - `deleted_at` (soft delete)
 - `created_at`, `updated_at`
 
-Laravel's `jobs` (+ `failed_jobs`) tables via `php artisan queue:table`, used solely for the delayed TTL job.
+Laravel's `jobs` (+ `failed_jobs`) tables via `php artisan queue:table`, used for the delayed TTL job *and* the immediate (no-delay) virus-scan job.
 
-New `.env` var: `FILE_DELETION_NOTIFICATION_EMAIL` (the recipient address named in the task).
+New `.env` vars: `FILE_DELETION_NOTIFICATION_EMAIL` (the recipient address named in the task), `CLAMAV_HOST`, `CLAMAV_PORT`.
 
 ## 5. Milestones
 
@@ -88,22 +93,35 @@ Verified working (2026-09-15): app reachable via nginx at `http://localhost:8000
 **M0 is now complete.** `vendor/` and `public/build/` are plain bind-mounted host directories (not named volumes — see `SESSION_LOG.md` for why); after any `composer.json`/`package.json`/frontend change, re-run `composer install` / `npm run build` (host-side or via a throwaway container) before relying on the running containers.
 
 **M1 — Upload backend**
-- [ ] `files` migration + `File` model (with `SoftDeletes`)
+- [x] `files` migration (incl. `scan_status`, `scanned_at`) — `database/migrations/2026_09_15_210808_create_files_table.php`
+- [x] `File` model (with `SoftDeletes`) — `app/Models/File.php`, factory at `database/factories/FileFactory.php` (with `expired()`/`clean()`/`infected()` states for upcoming tests)
 - [ ] Upload endpoint: validate mime type (PDF/DOCX) + 10MB size limit, store via filesystem disk, persist metadata, set `expires_at`
+- [ ] Filename encoding check: `mb_check_encoding($originalName, 'UTF-8')`, reject 422 if invalid
+- [ ] Structural sanity check: PDF magic bytes (`%PDF-`) / DOCX ZIP-openable with `[Content_Types].xml`, reject 422 if malformed
 - [ ] Dispatch delayed `DeleteExpiredFile` job at `expires_at`
-- [ ] Feature tests: valid upload, rejected mime type, rejected oversized file, job scheduled
+- [ ] Dispatch immediate `ScanUploadedFile` job (virus/macro scan via ClamAV — see below)
+- [ ] Feature tests: valid upload, rejected mime type, rejected oversized file, rejected bad-encoding filename, rejected malformed file, jobs scheduled/dispatched
+
+**M1.5 — Virus/macro scanning (ClamAV)**
+- [x] `docker-php-ext-install sockets` in `docker/php/Dockerfile`; rebuild `app`/`queue-worker`/`scheduler`
+- [x] `clamav` service in `docker-compose.yml` (`clamav/clamav:1.5`, persistent signature-DB volume, healthcheck); `queue-worker` depends on it
+- [x] `CLAMAV_HOST`/`CLAMAV_PORT` in `.env`/`.env.example`
+- [x] Verified end-to-end: `ext-sockets` loaded, `PING`→`PONG`, EICAR test string correctly detected via `zINSTREAM`, clean payload passes (2026-09-16)
+- [ ] Composer: ClamAV client package (`sunspikes/clamav-validator`-style — use its clamd-socket client directly, not its `Validator::extend` rule; fall back to the verified ~15-line custom INSTREAM client above if its internals aren't cleanly reusable standalone)
+- [ ] `ScanUploadedFile` job: streams file to `clamd`; infected → `FileDeletionService::delete($file, reason: 'infected')`; clean → `scan_status='clean'`, `scanned_at=now()`; exhausted retries on scanner error → `scan_status='error'` (never silently default to clean)
+- [ ] Tests: mocked-scanner unit tests for clean/infected paths; optional EICAR-string integration test against real `clamd`
 
 **M2 — Upload frontend**
 - [ ] Upload page (Bootstrap layout), jQuery-driven AJAX submit with progress/feedback
 - [ ] Client-side type/size checks mirroring server-side validation
 
 **M3 — File management page**
-- [ ] List page (name, size, uploaded-at, expires-at) via Bootstrap table
+- [ ] List page (name, size, uploaded-at, expires-at, `scan_status` badge) via Bootstrap table
 - [ ] Manual delete action (AJAX), wired through `FileDeletionService`
 - [ ] Feature tests: list reflects DB state, delete removes file + row + triggers deletion event
 
 **M4 — Shared deletion path + TTL**
-- [ ] `FileDeletionService`: delete physical file, soft-delete row with `deletion_reason`, publish AMQP message
+- [ ] `FileDeletionService`: delete physical file, soft-delete row with `deletion_reason` (`manual`/`ttl_expired`/`ttl_safety_net`/`infected`), publish AMQP message
 - [ ] `DeleteExpiredFile` job (consumes the database queue) calling the service with `ttl_expired`
 - [ ] `files:reap-expired` Artisan command + schedule entry (safety net), reason `ttl_safety_net`
 - [ ] Tests: job execution deletes file; reaper catches an "orphaned" expired row

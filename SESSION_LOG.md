@@ -135,3 +135,79 @@ Updated as we go; most recent entries at the bottom.
 - Fetched the built JS bundle — contains `jQuery`, `3.7.1`, and `bootstrap` identifiers.
 
 **Status:** M0 fully complete (all checklist items in `IMPLEMENTATION.md` §5 checked off). Next: awaiting go-ahead for M1 (upload backend — migration, model, upload endpoint, delayed TTL job dispatch).
+
+---
+
+## 2026-09-15 — Upload edge-case analysis (plan mode): encoding & virus/macro scanning
+
+**User request (plan mode):** Before starting M1, analyze `mb_check_encoding` (for wrong/unreadable encoding) and `adriengras/php-clamav` (for viruses/macros) — pros/cons and integration issues for this stack.
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`).
+
+**Research done:** checked `mbstring` is already loaded in the app container (`php -m`) despite not being explicitly installed in the Dockerfile — ships enabled by default in `php:8.3-fpm`. Checked `ext-sockets` is *not* loaded (would need adding). Web-searched `adriengras/php-clamav` (Packagist/GitHub) and fetched its README: v1.0.0 (Nov 2024), MIT, requires `ext-sockets`, low adoption (3 GitHub stars), API includes `scan()`/`scanInStream()`/`ping()`, supports TCP or Unix socket to `clamd`. Also searched for Laravel-ecosystem alternatives (`sunspikes/clamav-validator`, `digitalideastudio/clamav-validator`).
+
+**Key analysis point:** the two tools solve unrelated problems — `mb_check_encoding` only validates strings (the original filename, not file content) and can't detect corrupted files, viruses, or macros; ClamAV via `clamd` is the right tool for the virus/macro concern specifically because its signature DB covers Office-macro and PDF-exploit heuristics too, not just classic viruses.
+
+**Branching decisions, resolved via `AskUserQuestion`:**
+1. Invalid-UTF-8 filename → **reject upload (422)**.
+2. ClamAV scope → **integrate real ClamAV now** (not a stub), despite the added Docker resource cost (new `clamav` service, ~1-3GB RAM, signature-DB download needing internet on first boot).
+3. ClamAV client → **`sunspikes/clamav-validator`-style package** (over the originally-asked-about `adriengras/php-clamav`, and over writing a custom client).
+4. Scan timing → user pushed back on my original fail-open/fail-closed framing and asked directly whether async scanning + a "verified" status is even meaningful for protection. Answered: it's a *detection/cleanup/audit* control rather than a *preventive* one, but that distinction barely matters here specifically because decision 6 (M0) already rules out any download/preview feature — so there's no window where a not-yet-scanned file is actually exposed to anyone. User chose **async via queue + `scan_status` column**, reusing the existing database queue-worker and `FileDeletionService`/RabbitMQ pipeline (infected → `deletion_reason='infected'`, same notification path as any other deletion).
+
+**Integration wrinkle surfaced:** `sunspikes/clamav-validator`-style packages are built around Laravel's synchronous `Validator::extend` — that only fits a blocking-scan design. Since we're going async, implementation will need to call the package's underlying clamd-socket client directly from a queued job rather than through its validation-rule wrapper; noted as a to-confirm-in-code detail, with a ~30-line custom INSTREAM client as the documented fallback if that's not cleanly reusable standalone.
+
+**Plan written and approved:** `~/.claude/plans/before-starting-implementation-i-nested-lerdorf.md`. Folded into `IMPLEMENTATION.md`: new `scan_status`/`scanned_at` columns and a fourth `deletion_reason` value (`infected`) in §4; a new `clamav` Docker service in §3's service list; a new **M1.5 — Virus/macro scanning (ClamAV)** milestone (sockets extension, `clamav` service, `CLAMAV_HOST`/`CLAMAV_PORT` env vars, ClamAV client package, `ScanUploadedFile` job, tests); M1 gained the encoding + structural-validity checks; M3's list page gained a `scan_status` badge; M4's `FileDeletionService` bullet gained the `infected` reason.
+
+**Status:** Exited plan mode with the plan approved. Encoding/scanning design is now folded into `IMPLEMENTATION.md`. Still need to confirm with the user how they want to sequence the now-larger M1 implementation (step-by-step like M0, and in what order) before writing code.
+
+---
+
+## 2026-09-16 — M1.5 infra: ClamAV stood up and verified
+
+**User request:** Sequence M1/M1.5 as "infra first, then app code" (chose this over app-code-first or one combined pass).
+
+**Blocker found before starting:** official ClamAV docs list 3GiB minimum / 4GiB preferred RAM for `clamd`; Docker Desktop's VM was only allocated ~7.7GiB total (shared across every other service). Flagged this to the user rather than proceeding — asked whether to bump Docker's memory limit, proceed as-is and see what happens, or use a reduced-memory ClamAV config. **User chose to bump the limit.** I can't change Docker Desktop's GUI settings myself, so gave them the manual steps (Settings → Resources → Advanced → raise Memory slider, Apply & restart — recommended ~12GiB given the host has ~16GiB total). User did this and confirmed; verified afterward (`docker info`) that the VM now reports 11.68GiB, up from 7.71GiB.
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`) at both the start and after the memory-bump wait.
+
+**Changes:**
+- `docker/php/Dockerfile` — added `sockets` to the `docker-php-ext-install` list (shared by `app`/`queue-worker`/`scheduler`).
+- `docker-compose.yml` — new `clamav` service (`clamav/clamav:1.5` — this tag ships with a pre-baked signature DB, so first boot didn't need a lengthy `freshclam` download; picked over the `_base` variant for that reason), with a persistent `clamav-db` volume, port `3310` published, and a healthcheck using the image's bundled `clamdcheck.sh` (generous `start_period: 600s` in case a future pull *does* need a full signature download). `queue-worker` now has `depends_on: clamav: condition: service_healthy`.
+- `.env` / `.env.example` — added `CLAMAV_HOST=clamav`, `CLAMAV_PORT=3310`.
+
+**Verification (all passed):**
+- Rebuilt `app`/`queue-worker`/`scheduler` images, recreated all containers — all healthy, including `clamav` (came up healthy well within the timeout thanks to the pre-baked signature DB).
+- `php -m` in the `app` container confirms `sockets` loaded.
+- Wrote and ran an inline PHP script using `ext-sockets` to `PING` clamd directly → `PONG`.
+- Wrote and ran an inline PHP script implementing clamd's `zINSTREAM` protocol (length-prefixed chunks over the socket) and tested it against the industry-standard **EICAR test string** → correctly flagged (`stream: Eicar-Test-Signature FOUND`); tested a harmless string → correctly passed (`stream: OK`). Confirms the exact mechanism `ScanUploadedFile` will use works end-to-end, and gives a working ~15-line reference implementation in case `sunspikes/clamav-validator`'s internals turn out not to be cleanly reusable standalone (per the plan's documented fallback).
+- `clamav` startup log confirms PDF, XMLDOCS (OOXML/DOCX), and OLE2 (legacy Office/macro) scanning support all enabled — directly covers this project's file types and the macro concern that motivated this whole detour.
+
+**Status:** M1.5 infra complete and verified. Next: move to M1 app code (migration incl. `scan_status`/`scanned_at`, `File` model, upload endpoint with encoding/structural/MIME/size validation, `DeleteExpiredFile` + `ScanUploadedFile` job dispatch) and M1.5 app code (the `ScanUploadedFile` job itself, ClamAV client package decision).
+
+---
+
+## 2026-09-16 — M1: `files` migration
+
+**User request:** Go ahead with the migration files first (step-by-step within M1, matching the established M0 cadence).
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`).
+
+**Work:** Generated `database/migrations/2026_09_15_210808_create_files_table.php` via `php artisan make:migration create_files_table --create=files` (container clock is a day behind host date at generation time — cosmetic only, ordering vs. the existing `0001_01_01_*` migrations is unaffected), then filled in the schema per `IMPLEMENTATION.md` §4: `original_name`, `stored_path`, `mime_type` (strings), `size_bytes` (unsigned int), `expires_at` (timestamp, indexed — supports the M4 safety-net reaper's query), `deletion_reason` (enum: `manual`/`ttl_expired`/`ttl_safety_net`/`infected`, nullable), `scan_status` (enum: `pending`/`clean`/`infected`/`error`, default `pending`), `scanned_at` (nullable timestamp), plus `timestamps()` and `softDeletes()`.
+
+**Verification:** ran `migrate --force` — applied cleanly; inspected the live schema via `Schema::getColumns('files')` in tinker and confirmed every column/type/nullability matches the design exactly; ran `migrate:rollback --step=1` then `migrate` again to confirm `down()` also works cleanly, and left the migration applied.
+
+**Status:** Migration done and verified. Next (pending go-ahead): `File` model, then the upload `FormRequest`/endpoint.
+
+---
+
+## 2026-09-16 — M1: `File` model
+
+**User request:** Go ahead with the `File` model.
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`).
+
+**Work:** `php artisan make:model File --factory` → `app/Models/File.php` (added `SoftDeletes`, `$fillable` for all columns, `casts()` for `expires_at`/`scanned_at` as `datetime` and `size_bytes` as `integer`) and `database/factories/FileFactory.php` (random pdf/docx original name + matching mime type, `stored_path` under `uploads/`, size within the 10MB range, `expires_at` = +24h, `scan_status` defaults `pending`; added `expired()`, `clean()`, `infected()` factory states since M1/M1.5/M4 tests will need exactly those scenarios).
+
+**Verification:** via tinker — created a factory instance, confirmed `expires_at` casts to `Illuminate\Support\Carbon`; called `->delete()` and confirmed `trashed()` is true, the row is invisible to a default `File::find()` but still present via `withTrashed()` — soft delete behavior confirmed correct end-to-end against the real MySQL container. Cleaned up the test row afterward (`forceDelete`).
+
+**Status:** Model + factory done and verified. Next (pending go-ahead): the upload `FormRequest`/endpoint (MIME/size validation + the encoding/structural checks from the edge-case plan).
