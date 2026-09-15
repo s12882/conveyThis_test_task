@@ -6,6 +6,12 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
+/**
+ * @property int $id
+ * @property string original_name
+ * @property string stored_path
+ * @property string deletion_reason
+ */
 class File extends Model
 {
     /** @use HasFactory<\Database\Factories\FileFactory> */

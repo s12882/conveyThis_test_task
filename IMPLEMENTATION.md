@@ -95,12 +95,14 @@ Verified working (2026-09-15): app reachable via nginx at `http://localhost:8000
 **M1 — Upload backend**
 - [x] `files` migration (incl. `scan_status`, `scanned_at`) — `database/migrations/2026_09_15_210808_create_files_table.php`
 - [x] `File` model (with `SoftDeletes`) — `app/Models/File.php`, factory at `database/factories/FileFactory.php` (with `expired()`/`clean()`/`infected()` states for upcoming tests)
-- [ ] Upload endpoint: validate mime type (PDF/DOCX) + 10MB size limit, store via filesystem disk, persist metadata, set `expires_at`
-- [ ] Filename encoding check: `mb_check_encoding($originalName, 'UTF-8')`, reject 422 if invalid
-- [ ] Structural sanity check: PDF magic bytes (`%PDF-`) / DOCX ZIP-openable with `[Content_Types].xml`, reject 422 if malformed
-- [ ] Dispatch delayed `DeleteExpiredFile` job at `expires_at`
-- [ ] Dispatch immediate `ScanUploadedFile` job (virus/macro scan via ClamAV — see below)
-- [ ] Feature tests: valid upload, rejected mime type, rejected oversized file, rejected bad-encoding filename, rejected malformed file, jobs scheduled/dispatched
+- [x] Upload endpoint: validate mime type (PDF/DOCX) + 10MB size limit, store via filesystem disk, persist metadata, set `expires_at` — `POST /files`, `FileUploadController@store`, `app/Http/Requests/StoreFileRequest.php`
+- [x] Filename encoding check: `mb_check_encoding($originalName, 'UTF-8')`, reject 422 if invalid — `app/Rules/ValidFilenameEncoding.php`
+- [x] Structural sanity check: PDF magic bytes (`%PDF-`) / DOCX ZIP-openable with `[Content_Types].xml`, reject 422 if malformed — `app/Rules/ValidDocumentIntegrity.php`
+- [x] Dispatch delayed `DeleteExpiredFile` job at `expires_at` — dispatched from `FileUploadController::store()`
+- [x] Dispatch immediate `ScanUploadedFile` job (virus/macro scan via ClamAV — see below) — dispatched from `store()`, hand-built by the user in parallel (`App\Jobs\ScanUploadedFile`, `App\Services\VirusScanService`); scan logic itself still has a `// TODO`
+- [x] Feature tests: valid upload (PDF + DOCX), rejected mime type, rejected oversized file, rejected bad-encoding filename, rejected malformed/spoofed file, `DeleteExpiredFile` dispatch+delay assertion — `tests/Feature/FileUploadTest.php`, 9 tests passing
+
+**Note (2026-09-16):** from here on, the user is hand-editing files in parallel with me — `App\Services\FileDeletionService` (manual delete, `FileUploadController::destroy()`) and `App\Jobs\ScanUploadedFile`/`App\Services\VirusScanService` are theirs to finish; I re-read files before editing and flag anything that looks like an unintended bug rather than silently fixing or reverting. See `SESSION_LOG.md` for the reconciliation details.
 
 **M1.5 — Virus/macro scanning (ClamAV)**
 - [x] `docker-php-ext-install sockets` in `docker/php/Dockerfile`; rebuild `app`/`queue-worker`/`scheduler`

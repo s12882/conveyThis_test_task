@@ -211,3 +211,34 @@ Updated as we go; most recent entries at the bottom.
 **Verification:** via tinker — created a factory instance, confirmed `expires_at` casts to `Illuminate\Support\Carbon`; called `->delete()` and confirmed `trashed()` is true, the row is invisible to a default `File::find()` but still present via `withTrashed()` — soft delete behavior confirmed correct end-to-end against the real MySQL container. Cleaned up the test row afterward (`forceDelete`).
 
 **Status:** Model + factory done and verified. Next (pending go-ahead): the upload `FormRequest`/endpoint (MIME/size validation + the encoding/structural checks from the edge-case plan).
+
+---
+
+## 2026-09-16 — M1: upload endpoint, then discovered the user is hand-editing in parallel
+
+**User request:** Go ahead with the upload endpoint.
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`).
+
+**Built:** `config/files.php` (`ttl_hours` wrapping `FILE_TTL_HOURS`); `app/Rules/ValidFilenameEncoding.php` (`mb_check_encoding` on the client original filename) and `app/Rules/ValidDocumentIntegrity.php` (PDF magic-byte check / DOCX `ZipArchive` + `[Content_Types].xml` check) — both bound to the `file` field; `app/Http/Requests/StoreFileRequest.php` (`required|file|max:10240|mimetypes:application/pdf,...wordprocessingml.document` + the two custom rules, `authorize()` → `true` since decision 1 is no-auth); `FileUploadController::store()`; `POST /files` route. Files stored on the default `local` disk (`storage/app/private`) under `uploads/` — deliberately not the `public` disk, since decision 6 already rules out any download/serving feature, so there's no reason for uploads to be web-reachable at all.
+
+**Wrote `tests/Feature/FileUploadTest.php`** to verify the endpoint end-to-end (this doubles as real progress on the "Feature tests" checklist item, not just ad-hoc verification): valid PDF upload, valid DOCX upload (built via a real in-memory `ZipArchive` with `[Content_Types].xml`/`_rels/.rels`/`word/document.xml`, since Laravel's fake-file helper doesn't produce real zip bytes), rejected disallowed MIME, rejected oversized file, rejected invalid-UTF-8 filename, rejected spoofed-MIME/corrupted content.
+
+**Two things learned empirically (not obvious from memory, verified by actually running it):**
+1. Laravel's test HTTP client does **not** bypass CSRF automatically — plain `$this->post()` against a `web`-middleware route gets a real 419 without a token. Fixed by disabling `Illuminate\Foundation\Http\Middleware\PreventRequestForgery` in the test's `setUp()` (real traffic will supply the token via M2's AJAX headers — this is a test-only bypass, not a production change).
+2. A `FormRequest` validation failure on a non-JSON-Accept request redirects (302) rather than returning 422 — switched all test requests to `postJson()` to match how the real AJAX frontend will call it (`Accept: application/json`), which correctly gets 422 JSON responses.
+
+**Discovered mid-task: the user is hand-editing the same files concurrently.** Noticed `routes/web.php`, `FileUploadController.php`, and `File.php` changing on disk with a `destroy()` method + route referencing a not-yet-built `App\Service\FileDeletionService` (singular). Asked directly rather than guessing — confirmed the user is editing by hand alongside me. Resolved:
+- Namespace: agreed on `App\Services` (plural, matches the plan/Laravel convention) — the user's own file already had it right by the time I checked.
+- A `messages()` override in `StoreFileRequest` with dead keys (`document.*` instead of `file.*`) — user said they're still working on that file and will fix it themselves; left untouched.
+- Work split going forward: user takes `FileDeletionService`/`destroy()` and `ScanUploadedFile`/`VirusScanService`; I continue with `DeleteExpiredFile` dispatch (and, per the original plan, will pick up the rest of M1.5's scan-job scaffolding unless told otherwise).
+
+**Reconciling concurrent edits while wiring up `DeleteExpiredFile::dispatch()`:**
+- The user had already created `App\Jobs\DeleteExpiredFile` themselves (constructor `($fileId, $disk = 'public')`, correctly injects `FileDeletionService` into `handle()` not the constructor). Added the dispatch call in `store()`: `DeleteExpiredFile::dispatch($file->id, 'local')->delay($file->expires_at)` — passing `'local'` explicitly since that's the disk uploads actually land on (their default param says `'public'`, which doesn't match; flagged but didn't change their file).
+- Added a `Queue::fake()` test asserting the dispatch + delay, using `ReflectionProperty` to read the job's `protected` `$fileId` rather than adding a public getter to their class.
+- Mid-verification, the user's own concurrent addition of `ScanUploadedFile::dispatch(...)` in `store()` started throwing `ArgumentCountError` — their `ScanUploadedFile` job was injecting `VirusScanService` into the **constructor** (gets serialized into the queue payload — services aren't serializable) instead of `handle()`, unlike their own correct `DeleteExpiredFile` pattern. Flagged it plainly and asked how to handle rather than fixing silently; user asked me to fix just that constructor/handle split. By the time I went to make the edit, they'd already fixed it themselves — no edit needed from me.
+- One remaining bug was mine: the in-memory DOCX test fixture's zero-byte padding (`str_repeat('0', 1200)`) got deflated back under the app's `min:1` (KB) rule by `ZipArchive`'s default compression. Fixed by padding with `random_bytes()` (incompressible) instead.
+
+**Verification:** `php artisan test` — full suite green, 9 passed (30 assertions), including the DOCX case that needed the compression fix.
+
+**Status:** Upload endpoint (encoding + structural checks + MIME/size validation + storage + both job dispatches) complete and tested. Ongoing: user is actively finishing `FileDeletionService`, `VirusScanService`/`ScanUploadedFile`'s actual scan logic (still has a `// TODO`), and the `destroy()` manual-delete endpoint in parallel — re-read files before any further edits, since they're changing outside this conversation's edits too.
