@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
@@ -36,6 +37,27 @@ class File extends Model
             'scanned_at' => 'datetime',
             'size_bytes' => 'integer'
         ];
+    }
+
+    /**
+     * Human-readable file size (e.g. "1.1 KB"). Deliberately not using
+     * Illuminate\Support\Number::fileSize() here — it requires the `intl`
+     * PHP extension, which isn't installed in this project's Docker image.
+     */
+    protected function humanSize(): Attribute
+    {
+        return Attribute::make(get: function () {
+            $bytes = (float) $this->size_bytes;
+            $units = ['B', 'KB', 'MB', 'GB'];
+
+            $i = 0;
+            while ($bytes >= 1024 && $i < count($units) - 1) {
+                $bytes /= 1024;
+                $i++;
+            }
+
+            return round($bytes, 1).' '.$units[$i];
+        });
     }
 
     public function deleteWithReason(string $reason): ?bool

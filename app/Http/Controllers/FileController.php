@@ -32,7 +32,7 @@ class FileController extends Controller
 
     public function destroy(File $file, FileDeletionService $fileDeletionService): JsonResponse
     {
-        $result = $fileDeletionService->delete($file->id, 'manual');
+        $result = $fileDeletionService->delete($file->id, 'manual', 'local');
 
         return response()->json(['success' => $result], $result ? 200 : 500);
     }

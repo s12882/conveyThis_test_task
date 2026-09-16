@@ -24,7 +24,7 @@
                     @foreach ($files as $file)
                         <tr>
                             <td>{{ $file->original_name }}</td>
-                            <td>{{ \Illuminate\Support\Number::fileSize($file->size_bytes, precision: 1) }}</td>
+                            <td>{{ $file->human_size }}</td>
                             <td>
                                 @php
                                     $badgeVariant = match ($file->scan_status) {

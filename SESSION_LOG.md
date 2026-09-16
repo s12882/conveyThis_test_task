@@ -391,3 +391,29 @@ Updated as we go; most recent entries at the bottom.
 - Added `tests/Feature/UploadPageTest.php` (per the plan's M2 test scope). Full `--testsuite=Feature` run: 17/17 passing.
 
 **Status:** M2 complete and verified. Next (pending go-ahead): M3, the file management/list page (including the sorting feature added to the plan earlier this session).
+
+---
+
+## 2026-09-16 — M3: file management page (review first, then Blade)
+
+**User request:** Go ahead with M3. User had already started `FileController` and a new `IndexRequest` (for sorting) — asked me to check and suggest improvements first, then move on to the Blade files.
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`).
+
+**Review found two real issues, one confirmed live before touching anything:**
+1. `IndexRequest`'s `sort_by`/`order`/`per_page` rules (`string|in:...`) had no `sometimes`/fallback — verified via `Validator::make([], [...])` that *missing* fields validate fine (Laravel skips non-`required` rules when absent), but an *invalid* value (`?sort_by=password`) fails validation, and since these are plain `<a href>` links not form submissions, Laravel's default non-JSON failure handling kicks in. Confirmed with `curl "http://localhost:8000/files?sort_by=password"` → real `302` redirect to `/`, not staying on the file list. Exactly the failure mode the approved plan called out to avoid.
+2. `destroy()` didn't check `FileDeletionService::delete()`'s return value, always responding `success: true` even on failure.
+
+Presented both with concrete evidence, asked how to handle — user chose to fix both now (matching my recommendation). Dropped `IndexRequest` entirely (deleted the file), moved sort/order/per_page whitelisting into plain `in_array()`-with-fallback logic directly in `FileController::index()`; the user had already partially fixed `destroy()` themselves (checking the return value) so I completed it by adding the `500`/`200` status split.
+
+**Built the rest of M3** (per the approved plan): `resources/views/files/index.blade.php` (paginated Bootstrap table — name, size, `scan_status` badge, uploaded/expires dates, delete button), `files/partials/sort-link.blade.php` (sortable column headers, ▲/▼ indicator, toggles direction), `files/partials/delete-modal.blade.php` (shared Bootstrap modal, populated via JS from the clicked row's `data-*` attributes), and `initDeleteModal()` in `resources/js/app.js`.
+
+**Two more real bugs surfaced during verification (not in the original static review):**
+- Used `\Illuminate\Support\Number::fileSize()` for the size column per the plan's own suggestion — turned out to require the `intl` PHP extension, which isn't installed in this project's image. Caused a genuine `500` (confirmed via `storage/logs/laravel.log`: `The "intl" PHP extension is required...`), distinct from the earlier boot-slowness red herring (which I'd initially half-suspected when a `curl` request 504'd — that 504 turned out to be purely because `files/index.blade.php` didn't exist yet at that point in the sequence, not a new instance of the slowness issue). Fixed by adding a small `humanSize()` accessor (`Attribute::make()`) on the `File` model instead of installing `ext-intl` for one cosmetic formatter.
+- Manual delete via the real UI/AJAX path soft-deleted the DB row but left the physical file on disk. Same root cause as the `DeleteExpiredFile` disk-mismatch bug from the M1.5 session: `FileDeletionService::delete()` defaults `$disk` to `'public'`, uploads live on `'local'`, and `FileController::destroy()` wasn't passing the disk explicitly. Fixed the call site (`'local'` passed explicitly), matching the same pattern already used for `DeleteExpiredFile`'s dispatch call.
+
+**Verification (all via real HTTP, not just PHPUnit):** uploaded a real file via curl (AJAX-shaped: CSRF token + `X-Requested-With`/`Accept` headers) → confirmed it renders in the list with correct name/size/`pending` badge → confirmed `?sort_by=password` no longer redirects (stays `200`) → confirmed a valid sort actually reorders rows → deleted via a real `DELETE` request → confirmed the row disappears from the list, the DB row is soft-deleted (`deletion_reason=manual`), and — after the disk fix — the physical file is actually gone (was failing before the fix, confirmed the before/after difference directly). Cleaned up all test artifacts (DB rows + orphaned physical files) after each check.
+
+Added `tests/Feature/FileControllerTest.php` (5 tests: index reflects DB state, invalid params don't error, sorting reorders correctly, destroy soft-deletes + removes the file, destroy on an already-deleted file 404s — one test itself had a backwards assertion caught by its own failure message and fixed). Full Feature suite: 22/22 passing.
+
+**Status:** M3 complete and verified, including the sorting feature from the earlier plan expansion. M2+M3 (the whole frontend plan) are now done. Remaining milestones: M4 (TTL safety-net reaper — `FileDeletionService`/`DeleteExpiredFile` already done per the checklist), M5 (RabbitMQ — `AMPQService`'s uninitialized-connection bug still open, a `FileDeletedNotification` scaffold already exists per the user's own progress), M6 (polish).
