@@ -585,3 +585,30 @@ Added `tests/Feature/FileControllerTest.php` (5 tests: index reflects DB state, 
 **Verification:** stopped `rabbitmq-consumer` (operational rule), ran the full suite — 31/31 passing — then restarted it. All 8 containers confirmed healthy via `docker compose ps`.
 
 **Status:** M6 complete. All milestones (M0–M6) done — the full pipeline described in `TASK.md` (async upload with validation + virus/macro scanning, sortable file list with manual delete, 24h TTL via both a delayed job and a scheduled safety-net reaper, RabbitMQ-driven logged-email deletion notifications) is built, containerized, and has been verified against the real running stack throughout rather than relying only on mocks.
+
+---
+
+## 2026-09-16 — TASK.md changed: "safely increase size file limit"
+
+**User request:** Flagged a `TASK.md` change — new line: "Ability to safely increase size file limit (Increase cap for Nginx max upload size)." Asked directly: will increasing nginx's `client_max_body_size` (already bumped to 100M by the user, along with the earlier stale-upstream `resolver`/variable `fastcgi_pass` fix already in place) be enough?
+
+**TASK.md diff, checked in full against the recorded baseline** (not just the one flagged line): two other additions — "A page to upload a file" and "Pagination & sorting of uploaded files" — both already fully satisfied by existing M2/M3 work, no action needed. New baseline hash: `9f259ec776f4c975d997bd0cbb8dbba55dbebdd4692cd0a8ecd73e6f6305a1c9`.
+
+**Answered the direct question with evidence, not a guess:** checked `php -i` inside the running `app` container — `Loaded Configuration File => (none)`, `upload_max_filesize=2M`, `post_max_size=8M`. This image has **never had a `php.ini`** — pure PHP compile-time defaults the entire session. So no, nginx's cap alone was not enough: PHP itself would silently cap/empty `$_FILES` on anything over 2-8MB *before Laravel's own validation ever ran*, regardless of nginx. This had been true since M0 and completely invisible to the test suite, because `UploadedFile::fake()` (used by every test in this project) bypasses real HTTP multipart parsing and never exercises PHP's actual ini enforcement — the only ways to find this were checking `php -i` directly or attempting a genuine large HTTP upload, which is exactly what happened here.
+
+**Presented the three-layer picture (nginx / PHP / app) and offered a design choice:** static generous infra values matched to nginx's existing 100M vs. a fully env-var-templated nginx+php.ini system for a true one-variable "safely increase" story. User chose the simpler static option.
+
+**Built:**
+- `docker/php/uploads.ini` (`upload_max_filesize=100M`, `post_max_size=105M`, `memory_limit=256M`), copied into the image via `docker/php/Dockerfile`.
+- Bumped `fastcgi_read_timeout`/`fastcgi_send_timeout` to 300s in `docker/nginx/default.conf` — nginx's 60s default is realistic to exceed on a large upload over a slow connection, which is directly relevant to "safely" raising the cap (a valid large upload should fail on the size limit, not an unrelated timeout, if at all).
+
+**Verification — rebuilt the PHP images, recreated the containers, then proved it with real uploads (not just reading config back):**
+- `php -i` post-rebuild confirms the new values are active.
+- A genuine ~5MB PDF (`head -c 5242880 /dev/urandom | base64 ...`) — previously would have been silently rejected/truncated by PHP's old 2M default — now uploads successfully end-to-end via real `curl` HTTP requests with proper CSRF handling (`201`, correct `size_bytes: 5000069`).
+- A genuine ~12MB PDF (over the app's own `FILE_MAX_SIZE_KB=10240` limit, but comfortably under the new 100M infra caps) still gets cleanly rejected with the app's own accurate `422`/"File size must not exceed 10 MB" — confirming the three layers now cooperate correctly (infra permits up to 100M through, but the app's own business-level limit is still the one that actually governs what's accepted) rather than one layer silently overriding the others.
+- Bonus confirmation: recreating `app` for this rebuild triggered nginx's DNS resolution again — confirmed the earlier stale-upstream self-heal fix (from the prior M6 nginx-502 investigation) still works, no manual `webserver` restart needed.
+- Cleaned up all test artifacts (DB rows, physical files, local temp files) afterward. Stopped `rabbitmq-consumer` for the run (operational rule), full suite: 31/31 passing, restarted it after.
+
+**Documented:** added a "Safely increasing the upload size limit" subsection to `README.md`'s Configuration section, spelling out all three layers, why `FILE_MAX_SIZE_KB` alone doesn't work, and the exact steps (which files to touch, what needs a rebuild vs. just an `.env` change) to raise the limit correctly in the future.
+
+**Status:** Upload limit is now genuinely, safely adjustable across all three layers, verified with real uploads in both directions (under and over the limit). TASK.md's new requirement fully addressed; the other two additions in this revision were already covered by existing work.

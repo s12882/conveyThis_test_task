@@ -86,6 +86,16 @@ Everything below is a `.env` var (see `.env.example` for defaults); the app-spec
 | `RABBITMQ_FILE_DELETIONS_QUEUE` | Queue name for deletion events (default `file_deletions`) |
 | `CLAMAV_HOST`/`PORT` | `clamd` connection |
 
+### Safely increasing the upload size limit
+
+`FILE_MAX_SIZE_KB` alone is **not** enough — three independent layers all cap upload size, and the smallest one wins:
+
+1. **nginx** — `client_max_body_size` in `docker/nginx/default.conf` (currently 100M). Requests larger than this get a `413` before they ever reach PHP.
+2. **PHP** — `upload_max_filesize`/`post_max_size` in `docker/php/uploads.ini` (currently 100M/105M). There's no `php.ini` in this image otherwise — without this file, PHP falls back to its compile-time defaults (`2M`/`8M`), which silently caps or empties `$_FILES` on anything bigger, *before Laravel's own validation ever runs*. This is easy to miss: `UploadedFile::fake()` (used by all of this project's tests) bypasses real HTTP multipart parsing, so no test can catch a misconfiguration here — only a real upload or checking `php -i` reveals it.
+3. **The app** — `FILE_MAX_SIZE_KB` (`config('files.max_size_kb')`), enforced by `StoreFileRequest`'s `max:` rule and mirrored client-side in the upload form's JS pre-check. This is the actual business-level limit that should govern what's *accepted*; (1) and (2) just need enough headroom above it to not interfere.
+
+To raise the limit: bump `client_max_body_size` and `upload_max_filesize`/`post_max_size` (keep `post_max_size` a bit above `upload_max_filesize` for multipart overhead, and `memory_limit` comfortably above `post_max_size`), rebuild the `app`/`queue-worker`/`scheduler`/`rabbitmq-consumer` images, then raise `FILE_MAX_SIZE_KB` to whatever you actually want enforced (no rebuild needed for that one — it's read from `.env` at runtime). If you're moving to something large, also check `fastcgi_read_timeout`/`fastcgi_send_timeout` in the nginx config (currently 300s) — a big upload on a slow connection can outrun the default 60s and fail on an unrelated timeout instead of the size limit.
+
 ## Running tests
 
 ```sh

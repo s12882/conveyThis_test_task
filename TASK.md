@@ -8,7 +8,7 @@
 ### File Upload
 - Implement an asynchronous file uploader (PDF, DOCX) via a web interface.
 - File size limit (e.g., 10MB).
-- Ability to safely increase size limit (Increase cap for Nginx max upload size)
+- Ability to safely increase file size limit (Increase cap for Nginx & PHP max upload size)
 - Information about uploaded files must be stored in the MySQL database.
 
 ### Pages
