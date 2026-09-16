@@ -8,11 +8,13 @@
 ### File Upload
 - Implement an asynchronous file uploader (PDF, DOCX) via a web interface.
 - File size limit (e.g., 10MB).
+- Ability to safely increase size limit (Increase cap for Nginx max upload size)
 - Information about uploaded files must be stored in the MySQL database.
 
 ### Pages
 - A page to upload a file.
 - A separate page for managing uploaded files.
+- Pagination & sorting of uploaded files.
 - The ability to view a list of uploaded files.
 - The ability to delete files manually.
 

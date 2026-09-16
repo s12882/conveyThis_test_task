@@ -29,7 +29,7 @@ class FileUploadTest extends TestCase
         parent::setUp();
 
         Storage::fake('local');
-
+        // Claude:
         // Real requests go through M2's CSRF-token-header wiring; these tests
         // exercise upload validation/storage, not CSRF enforcement itself.
         $this->withoutMiddleware(PreventRequestForgery::class);
@@ -123,6 +123,7 @@ class FileUploadTest extends TestCase
 
     public function test_rejects_a_file_that_claims_to_be_a_pdf_but_is_not(): void
     {
+        // Claude:
         // Mimics a spoofed upload: the browser/client claims application/pdf,
         // but the actual bytes don't start with the PDF magic header.
         $upload = UploadedFile::fake()->create('fake.pdf', 10, 'application/pdf');
@@ -131,6 +132,30 @@ class FileUploadTest extends TestCase
 
         $response->assertUnprocessable();
         $response->assertJsonValidationErrors('file');
+        $this->assertDatabaseCount('files', 0);
+    }
+
+    public function test_returns_a_clean_error_when_storage_fails(): void
+    {
+        // Claude:
+        // Simulates e.g. a full disk: Laravel's Flysystem-backed disks throw
+        // rather than returning false, so this should be caught cleanly
+        // instead of surfacing as a raw 500.
+        $this->app->bind(\Illuminate\Contracts\Filesystem\Factory::class, function () {
+            $disk = \Mockery::mock(\Illuminate\Contracts\Filesystem\Filesystem::class);
+            $disk->shouldReceive('putFileAs')->andThrow(new \RuntimeException('No space left on device'));
+
+            $factory = \Mockery::mock(\Illuminate\Contracts\Filesystem\Factory::class);
+            $factory->shouldReceive('disk')->andReturn($disk);
+
+            return $factory;
+        });
+
+        $upload = UploadedFile::fake()->createWithContent('report.pdf', self::minimalPdf());
+
+        $response = $this->postJson('/files', ['file' => $upload]);
+
+        $response->assertStatus(503);
         $this->assertDatabaseCount('files', 0);
     }
 

@@ -11,7 +11,8 @@
         "laravel/tinker": "^3.0",
         "php-amqplib/php-amqplib": "^3.7",
         "xenolope/quahog": "^3.0",
-        "ext-sockets": "*"
+        "ext-sockets": "*",
+        "ext-zip": "*"
     },
     "require-dev": {
         "fakerphp/faker": "^1.23",

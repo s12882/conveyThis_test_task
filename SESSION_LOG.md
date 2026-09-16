@@ -536,3 +536,52 @@ Added `tests/Feature/FileControllerTest.php` (5 tests: index reflects DB state, 
 - Deleted it through the real UI flow (click Delete → confirm in modal) — this time the modal closed automatically, and the "File deleted." success alert appeared (it never could before — the crash happened on the line immediately before that alert call). `read_console_messages` came back clean, no errors at all.
 
 **Status:** Delete-modal bug fixed and verified live, both before and after. No automated test added — this project has no JS test tooling, and the live browser reproduction (screenshot + console capture) served as the verification instead. Closed both browser tabs afterward.
+
+---
+
+## 2026-09-16 — Reviewed user's AMPQService refactor (consume logic reuse + stdout logging)
+
+**User request:** Refactored `ConsumeFileDeletions` to delegate to a new `AMPQService::queryConsume()` (reusing the service instead of duplicating consume logic in the command), losing the command's `$this->info()` output in the process. Asked what the best replacement for stdout was (guessed Monolog); after implementing it, asked me to check the logging setup and `queryConsume()`.
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`) throughout.
+
+**Stdout question, answered directly:** recommended a dedicated Monolog channel (`StreamHandler` targeting `php://stdout`) over passing `OutputInterface`/`$this->info` into the service — keeps `AMPQService` decoupled from the console layer, and matches the Docker/12-factor convention that `docker logs` reads a container's stdout natively (which the README already documents as the way to watch the pipeline).
+
+**First review pass — one severe bug found and confirmed live:** `queryConsume(string $queue, string $recipient, int $limit)` had `$limit` as non-nullable `int`, but the command passes `null` whenever `--limit` is omitted (every normal/production invocation — exactly what the `rabbitmq-consumer` Docker service runs). Reproduced directly: `docker compose exec app php artisan rabbitmq:consume-file-deletions` (no flags) threw a fatal `TypeError` immediately. Also flagged the `$this->info("Listening on...")` call now running *after* `queryConsume()` returns (meaningless — that call blocks for the entire consume loop, so in production it never prints, in test mode it prints after the fact).
+
+**User fixed both, asked for a second check:** re-read the updated `AMPQService.php` — `?int $limit = null` now correct; `Log::channel('consumer_stdout')->info(...)` moved before `basic_consume()`, so it now genuinely announces before listening starts. Verified the new `consumer_stdout` Monolog channel's config key choice (`'with'` rather than `'handler_with'`) was actually valid by reading `LogManager::createMonologDriver()` directly rather than assuming — confirms both keys are merged and either works.
+
+**Live verification (not just re-reading code):**
+- Ran the real no-flag invocation again — `TypeError` gone, command blocks correctly (confirmed via a `timeout`-wrapped run).
+- Started the actual `rabbitmq-consumer` container, published a real message via tinker, and confirmed via `docker logs conveythis-rabbitmq-consumer` that both `Listening on [file_deletions]...` and `Notified ... about deletion of file #999` now appear — restoring exactly what the README documents.
+- Stopped the consumer, ran the full suite (per the established operational rule) — 28/28 passing — then restarted it.
+
+**Flagged, not fixed (user said "consider this fixed," i.e. leave as-is):** the failure path in `handleMessage()`'s `catch` block still logs to the default channel, not `consumer_stdout` — a processing failure won't show in `docker logs`, only successes will. `ConsumeFileDeletions.php` still has several unused imports left over from before the logic moved into `AMPQService`.
+
+**Status:** AMPQService/consumer refactor reviewed, both real bugs confirmed fixed and verified live. Moving to the final M6 item next: cleanup/error-handling for edge cases.
+
+---
+
+## 2026-09-16 — Final M6 item: edge-case hardening
+
+**User request:** Move on to the final M6 step (per `IMPLEMENTATION.md`'s remaining checklist item: "Cleanup, error handling for edge cases (upload during low disk space, RabbitMQ temporarily down, etc.)").
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`) throughout.
+
+**Re-read `FileDeletionService`/`FileUploadController` specifically looking for the two named cases, and found real gaps in both:**
+- `FileDeletionService::delete()`: `File::find($id)` returning `null` (a genuine race — e.g. the TTL reaper reads a batch of expired IDs, one gets manually deleted before the reaper's loop reaches it) would fatal on `$file->deleteWithReason()` — and the `catch` block's own error-logging line (`"...{$file->original_name}..."`) would *also* fatal on the still-null `$file`, a double-fault with the second exception left completely uncaught. Separately, a notification-publish failure was caught by the *same* try/catch as the actual deletion, so `delete()` returned `false` even when the file really had been deleted — misleading the caller.
+- `FileUploadController::store()`: no handling at all for `$uploaded->store('uploads')` failing — Laravel's Flysystem disks throw (not return `false`) on a write failure, so a full disk would surface as a raw uncaught 500.
+
+**Fixed both:**
+- `FileDeletionService::delete()` restructured into three phases: find-or-return-false-gracefully (logs a warning, no crash), delete with its own try/catch (returns `false` only if *this* fails), then notify as best-effort (a publish failure is logged but no longer flips the return value, since the file's already gone by that point).
+- `FileUploadController::store()` wraps the `store()` call in try/catch, logs the failure, returns a clean `503` instead of an uncaught exception.
+
+**Tests added:**
+- `tests/Feature/FileDeletionServiceTest.php` — missing file returns `false` without crashing; a thrown `AMPQService` (bound as a throwing stub, simulating RabbitMQ down) still results in `delete()` returning `true` with the file actually gone.
+- New case in `tests/Feature/FileUploadTest.php` — bound a Mockery-mocked `Illuminate\Contracts\Filesystem\Factory` whose disk throws on `putFileAs` (simulating a real Flysystem write failure, e.g. a full disk, without needing to actually exhaust real disk space) — asserts a clean `503`, no DB row created.
+
+**Went further and verified the RabbitMQ-down case against the real broker, not just the mock** (matching this session's established preference for testing real infra): stopped the actual `rabbitmq` container, ran a real `FileDeletionService::delete()` call — still returned `true`, file still correctly soft-deleted and physically removed (took ~4s, mostly the TCP connect timeout — a latency cost worth knowing about, not fixed further). Confirmed via `storage/logs/laravel.log` that the failure was logged clearly. Also incidentally confirmed the fix is robust against *either* RabbitMQ failure shape — a connect-time failure (caught inside `AMPQService`'s constructor, which then leaves `$connection` uninitialized) surfaces as the less-informative "must not be accessed before initialization" error when `publishFileDeletion()` tries to use it, but the new broad `catch (Throwable $e)` around the publish call in `FileDeletionService` absorbs it the same way regardless — flagged as a minor "confusing secondary log message" cosmetic issue, not a functional bug, left as-is. Restarted `rabbitmq` and `rabbitmq-consumer` afterward; confirmed the DB had no leftover test rows.
+
+**Verification:** stopped `rabbitmq-consumer` (operational rule), ran the full suite — 31/31 passing — then restarted it. All 8 containers confirmed healthy via `docker compose ps`.
+
+**Status:** M6 complete. All milestones (M0–M6) done — the full pipeline described in `TASK.md` (async upload with validation + virus/macro scanning, sortable file list with manual delete, 24h TTL via both a delayed job and a scheduled safety-net reaper, RabbitMQ-driven logged-email deletion notifications) is built, containerized, and has been verified against the real running stack throughout rather than relying only on mocks.
