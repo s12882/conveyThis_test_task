@@ -1,58 +1,108 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# conveyThis — Async File Uploader
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+An async PDF/DOCX uploader built with Laravel, MySQL, RabbitMQ, ClamAV, and Bootstrap/jQuery. Files are scanned for viruses/macros, auto-expire after 24 hours, and every deletion (manual or automatic) triggers an email notification via a RabbitMQ-driven pipeline. See `TASK.md` for the original requirements and `IMPLEMENTATION.md` for the full design/decision log.
 
-## About Laravel
+## Stack
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+- PHP 8.3 + Laravel 13
+- MySQL 8.4
+- RabbitMQ 3.13 (management plugin)
+- ClamAV (`clamd`) for virus/macro scanning
+- Bootstrap 5 + jQuery, built with Vite
+- Docker Compose
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+## How it works
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+1. **Upload** (`/`) — a single PDF/DOCX (≤10MB) is validated (MIME type, filename encoding, structural integrity) and stored via AJAX. Every upload gets a 24h expiry and is queued for a virus/macro scan.
+2. **Scanning** — a background job streams the file to ClamAV. Infected files are deleted immediately; clean files are marked `clean`.
+3. **Manage Files** (`/files`) — a paginated, sortable list of uploads with a scan-status badge and a manual delete button (Bootstrap-modal-confirmed).
+4. **Expiry** — each upload schedules its own delayed deletion job for ~24h later; a scheduled safety-net command also sweeps for any file that slipped through (e.g. a missed delayed job).
+5. **Deletion → notification** — however a file is deleted (manual, TTL, or infected), the same service publishes an event to RabbitMQ. A long-running consumer picks it up and sends a notification email — logged, not actually delivered, per the task's requirements.
 
-## Learning Laravel
+## Prerequisites
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
+- Docker Desktop (with at least ~12GiB memory allocated — ClamAV alone wants 3–4GiB; see `IMPLEMENTATION.md` for why)
+- No local PHP/Node/Composer install needed — everything runs in containers
 
-In addition, [Laracasts](https://laracasts.com) contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
+## Getting started
 
-You can also watch bite-sized lessons with real-world projects on [Laravel Learn](https://laravel.com/learn), where you will be guided through building a Laravel application from scratch while learning PHP fundamentals.
-
-## Agentic Development
-
-Laravel's predictable structure and conventions make it ideal for AI coding agents like Claude Code, Cursor, and GitHub Copilot. Install [Laravel Boost](https://laravel.com/docs/ai) to supercharge your AI workflow:
-
-```bash
-composer require laravel/boost --dev
-
-php artisan boost:install
+```sh
+cp .env.example .env   # already has working defaults for this Docker setup
+docker compose up -d --build
+docker compose exec app php artisan key:generate
+docker compose exec app php artisan migrate --force
 ```
 
-Boost provides your agent 15+ tools and skills that help agents build Laravel applications while following best practices.
+Frontend assets need to be built once (and again after any `resources/js`/`resources/css` change) via a throwaway Node container, since the host has no Node installed:
 
-## Contributing
+```sh
+docker run --rm -v "${PWD}:/app" -w /app node:20-alpine sh -c "npm install && npm run build"
+```
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+Then visit:
 
-## Code of Conduct
+| URL | What |
+|---|---|
+| http://localhost:8000/ | Upload page |
+| http://localhost:8000/files | Manage Files page |
+| http://localhost:15672 | RabbitMQ management UI (`guest`/`guest`) |
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+## Services & ports
 
-## Security Vulnerabilities
+| Service | Role | Port(s) |
+|---|---|---|
+| `app` | PHP-FPM (Laravel) | — |
+| `webserver` | nginx | 8000 |
+| `mysql` | Database | 3306 |
+| `rabbitmq` | Broker + management UI | 5672, 15672 |
+| `clamav` | `clamd` virus scanner | 3310 |
+| `queue-worker` | `queue:work database` — TTL-deletion + scan jobs | — |
+| `scheduler` | `schedule:work` — runs the TTL safety-net reaper every 5 min | — |
+| `rabbitmq-consumer` | `rabbitmq:consume-file-deletions` — sends deletion-notification emails | — |
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+All services are on the `conveythis` Docker network and reach each other by service name (e.g. the app connects to `mysql`, `rabbitmq`, `clamav`).
 
-## License
+## Watching the "sent" email
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+No real SMTP is configured (`MAIL_MAILER=log`, per the task's requirements) — every notification is rendered as a full email and written to the log instead of actually sent. To watch it happen:
+
+```sh
+docker compose logs -f rabbitmq-consumer   # confirms the consumer picked up the deletion event
+docker compose exec app tail -f storage/logs/laravel.log   # the rendered email (From/To/Subject/HTML body) lands here
+```
+
+Trigger one: upload a file on `/`, then delete it on `/files` (or wait ~24h, or run `docker compose exec app php artisan files:reap-expired` to force the safety-net path).
+
+## Configuration
+
+Everything below is a `.env` var (see `.env.example` for defaults); the app-specific ones live in `config/files.php` and `config/services.php`:
+
+| Variable | Purpose |
+|---|---|
+| `FILE_TTL_HOURS` | Hours before an upload auto-expires (default 24) |
+| `FILE_MAX_SIZE_KB` | Max upload size in KB (default 10240 = 10MB) |
+| `FILE_DELETION_NOTIFICATION_EMAIL` | Recipient for deletion-notification emails — **still the placeholder `notify@example.com`, set it to a real address** |
+| `RABBITMQ_HOST`/`PORT`/`USER`/`PASSWORD` | Broker connection |
+| `RABBITMQ_FILE_DELETIONS_QUEUE` | Queue name for deletion events (default `file_deletions`) |
+| `CLAMAV_HOST`/`PORT` | `clamd` connection |
+
+## Running tests
+
+```sh
+docker compose stop rabbitmq-consumer   # see note below
+docker compose exec app php artisan test
+docker compose up -d rabbitmq-consumer  # bring it back afterward
+```
+
+The suite hits real infrastructure rather than mocking everything — real MySQL, real ClamAV (using the industry-standard EICAR test string), and real RabbitMQ. **Stop `rabbitmq-consumer` before running tests**: since there's no separate test broker, a live consumer will race the tests for messages on the same queue and cause spurious failures.
+
+## Notes / known limitations
+
+- No authentication — the file list is shared and unauthenticated, per the task's scope.
+- No download/preview of uploaded files by design — the app only lists and deletes.
+- `FILE_DELETION_NOTIFICATION_EMAIL` ships as a placeholder; set it before relying on notifications for anything beyond local testing.
+- See `IMPLEMENTATION.md` for the full milestone-by-milestone build log, architecture decisions, and bugs found/fixed along the way.
+
+## Troubleshooting
+
+**`http://localhost:8000` returns 502, other services are fine.** Almost always nginx holding a stale upstream IP for the `app` container — happens if `app` gets rebuilt/recreated (`docker compose up -d --build app`, etc.) without also touching `webserver`. `docker/nginx/default.conf` resolves `app` through Docker's embedded DNS (`resolver 127.0.0.11 valid=10s;` + a variable-based `fastcgi_pass`) specifically so this self-heals within ~10s — but if you're still on an older container that predates that fix, `docker compose restart webserver` clears it immediately. Confirm the diagnosis via `docker compose logs webserver | grep "connect() failed"` — it'll show an upstream IP that no longer matches `docker inspect conveythis-app --format '{{.NetworkSettings.Networks.conveythis_test_task_conveythis.IPAddress}}'`.

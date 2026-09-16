@@ -476,3 +476,63 @@ Added `tests/Feature/FileControllerTest.php` (5 tests: index reflects DB state, 
 **Flagged, not fixed (pre-existing, unrelated to this session's work):** `FILE_DELETION_NOTIFICATION_EMAIL` is still the M0 placeholder (`notify@example.com`) — the pipeline now genuinely sends (logged) notifications there, so it's worth setting to a real address.
 
 **Status:** M5 complete — the full pipeline (upload → scan/manual-delete/TTL-expiry → `FileDeletionService` → AMQP → `rabbitmq-consumer` → logged email) works end-to-end, verified live. `rabbitmq-consumer` left running. Remaining: M6 polish (README, end-to-end docs, edge-case hardening) is the only milestone left per `IMPLEMENTATION.md`.
+
+---
+
+## 2026-09-16 — M6: README (user verifying in parallel)
+
+**User request:** Write the README while the user does their own independent verification pass.
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`).
+
+**Approach:** since the user was actively verifying at the same time, kept this turn to documentation only — no code/docker/env changes, nothing that could interfere with whatever they're checking.
+
+**Replaced `README.md`** (was still the stock `laravel/laravel` skeleton boilerplate — Laravel marketing copy, no project content) with project-specific documentation: what the app does and how the pipeline works (upload → scan → list/expire → delete → AMQP → email), prerequisites (Docker memory note, linking back to the M1.5 ClamAV RAM finding), getting-started steps, a services/ports table (cross-checked against the actual `docker-compose.yml`), how to watch the "sent" email (`rabbitmq-consumer` logs + `laravel.log`), a config-variable reference table, how to run tests (including the `rabbitmq-consumer`-must-be-stopped caveat discovered last session), and known limitations (no auth, no download/preview, the still-placeholder notification email).
+
+**Caught one accuracy issue before it shipped**: the getting-started steps originally had `cp .env.example .env` straight into `docker compose up`, but `.env.example`'s `APP_KEY` is intentionally blank (confirmed via `grep`) — following those steps literally would boot the app with no encryption key. Added `php artisan key:generate` to the sequence.
+
+**Status:** README done. Did not execute the getting-started steps against a fresh `.env` (would have overwritten the real one with a blank `APP_KEY` mid-session) — verified accuracy by cross-referencing `docker-compose.yml`/`.env.example` directly instead. Only remaining M6 item: edge-case hardening (low disk space, RabbitMQ temporarily down, etc.), not yet addressed.
+
+---
+
+## 2026-09-16 — Nginx 502 during user's verification pass (stale upstream DNS)
+
+**User request:** RabbitMQ UI works, but `http://localhost:8000` returns 502 — asked me to investigate, mentioned they were about to look at the nginx config themselves.
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`). Noted `.env` had changed on disk (new `APP_KEY`) — consistent with the user having just run through the README's getting-started steps (`cp .env.example .env` + `php artisan key:generate`) as part of their verification.
+
+**Diagnosis:**
+- `docker compose ps` showed `app`/`queue-worker`/`scheduler`/`rabbitmq-consumer` all "Up 3 minutes" (recently recreated), while `webserver`/`mysql`/`rabbitmq`/`clamav` were "Up 15 hours" (untouched) — a clear asymmetry pointing at the app image having been rebuilt without the web server being touched.
+- `docker compose logs webserver` showed the exact cause: `connect() failed (111: Connection refused) ... upstream: "fastcgi://172.18.0.5:9000"` — but `docker inspect conveythis-app` showed the container's real current IP was `172.18.0.6`. Nginx's `fastcgi_pass app:9000;` (a static hostname) resolves once at nginx startup and caches that IP for the life of the worker process; since `app` had been recreated (new internal IP) while `webserver` hadn't restarted, nginx was still trying the dead old IP.
+
+**Immediate fix:** `docker compose restart webserver` — confirmed `GET /` and `GET /files` both back to 200 right away.
+
+**Structural fix (so this can't silently recur):** edited `docker/nginx/default.conf` — added `resolver 127.0.0.11 valid=10s;` (Docker's embedded DNS server) and changed the static `fastcgi_pass app:9000;` to a variable (`set $upstream_app app:9000; fastcgi_pass $upstream_app;`). This is the standard, well-known nginx-in-Docker pattern: a literal hostname in `fastcgi_pass`/`proxy_pass` resolves once and caches forever, but routing through a variable forces nginx to re-resolve via the configured `resolver` on its TTL, so it converges on a new upstream IP within ~10s instead of needing a manual restart. Verified `nginx -t` (valid) + `nginx -s reload` (applied live, no restart needed) + app still reachable. Attempted to reproduce the original failure by force-recreating `app` again to confirm the self-heal — Docker happened to reassign the exact same IP both times I tried, so I couldn't force a literal repro of the fix converging after a real IP change; didn't keep chasing it further since the pattern itself is standard/well-established, not something novel needing extra proof.
+
+**Documented:** added a "Troubleshooting" section to `README.md` (symptom, cause, how to confirm via `docker compose logs webserver` + `docker inspect`) in case a container from before this fix ever needs the manual `restart webserver` workaround.
+
+**Status:** App back up (200 on `/` and `/files`), nginx config now self-heals from `app` container recreation going forward. All services confirmed healthy (`docker compose ps`).
+
+---
+
+## 2026-09-16 — Delete-modal JS bug, reproduced and fixed via Claude in Chrome
+
+**User request:** Use Claude in Chrome to test `http://localhost:8000/files`. Reported: deleting a file works (backend confirms), but the confirmation modal doesn't auto-close, with a console error `Uncaught ReferenceError: bootstrap is not defined` — suspected that's why the modal doesn't close.
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`).
+
+**Reproduced live before touching any code:**
+- Loaded the browser tools (`tabs_context_mcp`, `navigate`, `computer`, `find`, `read_console_messages`, `browser_batch`, `file_upload`), opened `/files` — found the user's own already-uploaded test file still sitting there (`Закриття ФОП.pdf`, status Clean).
+- Clicked its Delete button, confirmed in the Bootstrap modal, then read the console: `ReferenceError: bootstrap is not defined`, thrown inside the AJAX `.done()` handler (jQuery's `fireWith`/`resolveWith` → the done callback) — i.e. right after row removal, before the modal-close line. A follow-up screenshot confirmed the row really was gone from the table while the modal backdrop stayed up — matching the report exactly.
+- Confirmed the modal's own X/Cancel buttons (Bootstrap's native `data-bs-dismiss` handling) still worked fine on their own (closed after a brief fade) — proving Bootstrap's data-api itself was working; only *our own* JS's programmatic reference to `bootstrap.Modal` was broken.
+
+**Root cause:** `resources/js/app.js` had `import 'bootstrap/dist/js/bootstrap.bundle.min.js';` — a side-effect-only import. That's sufficient to register Bootstrap's `data-bs-*` auto-behaviors (which is why the X/Cancel buttons worked), but it doesn't bind the module to any variable — so `bootstrap.Modal.getInstance($modal[0])?.hide()` (used in both the delete success and failure handlers, to close the modal programmatically) referenced a name that was never defined anywhere in scope.
+
+**Fix:** `import bootstrap from 'bootstrap/dist/js/bootstrap.bundle.min.js';` — same exact bundle file (keeps all the already-working data-api behavior untouched, avoids introducing a separate `@popperjs/core` ESM resolution path that switching to the bare `bootstrap` package's ESM build would have needed), just captured as a proper default import — Vite's CJS interop exposes a UMD bundle's `module.exports` (the `{Alert, Button, Modal, ...}` namespace) as the default export, which is exactly what the old `window.bootstrap` global used to provide.
+
+**Re-verification (same live browser flow, this time end-to-end):**
+- Created a minimal real PDF fixture in the session's scratchpad directory (needed for `file_upload`, which only accepts files already shared with the session).
+- Rebuilt frontend assets (the established throwaway-node-container pattern), uploaded the fixture through the actual upload page (`file_upload` on the file input, click the real Upload button), navigated to `/files` — confirmed it listed with a `Clean` badge.
+- Deleted it through the real UI flow (click Delete → confirm in modal) — this time the modal closed automatically, and the "File deleted." success alert appeared (it never could before — the crash happened on the line immediately before that alert call). `read_console_messages` came back clean, no errors at all.
+
+**Status:** Delete-modal bug fixed and verified live, both before and after. No automated test added — this project has no JS test tooling, and the live browser reproduction (screenshot + console capture) served as the verification instead. Closed both browser tabs afterward.
