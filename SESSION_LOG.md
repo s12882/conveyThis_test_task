@@ -242,3 +242,75 @@ Updated as we go; most recent entries at the bottom.
 **Verification:** `php artisan test` — full suite green, 9 passed (30 assertions), including the DOCX case that needed the compression fix.
 
 **Status:** Upload endpoint (encoding + structural checks + MIME/size validation + storage + both job dispatches) complete and tested. Ongoing: user is actively finishing `FileDeletionService`, `VirusScanService`/`ScanUploadedFile`'s actual scan logic (still has a `// TODO`), and the `destroy()` manual-delete endpoint in parallel — re-read files before any further edits, since they're changing outside this conversation's edits too.
+
+---
+
+## 2026-09-16 — M1.5: ClamAV client package, ScanUploadedFile, tests
+
+**User request:** Continue with ClamAV client package configuration, `ScanUploadedFile`, and tests for it. Explicit permission given this step to modify manually-created files without asking first (review/verification deferred to the user).
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`).
+
+**Investigated the actual package chain before installing anything:** `sunspikes/clamav-validator` (the plan's chosen approach) turned out to just be a thin Laravel-validator wrapper around `xenolope/quahog` (real repo: `jonjomckay/quahog`) — the actual clamd-socket client, which itself depends on `clue/socket-raw`. Since the plan's decision was explicitly "use its clamd-socket client directly, not its `Validator::extend` rule," installed `xenolope/quahog` directly rather than pulling in `sunspikes/clamav-validator`'s unused ServiceProvider/validation-rule layer. Bonus: `quahog`'s `Result` class (`isOk()`/`isFound()`/`isError()`/`getReason()`) gives exactly the clean/infected/error distinction the plan needed — better than a plain boolean.
+
+**Built:**
+- `config/services.php` — added a `clamav` block (`host`/`port`/`timeout`, reading the `.env` vars from the M1.5 infra step).
+- `app/Services/VirusScanService.php` — rewritten from the user's hand-rolled raw-socket version to wrap `Xenolope\Quahog\Client` (via `Socket\Raw\Factory`), returning the real `Result` object. Connection failures deliberately aren't caught here — they propagate up so the queued job's normal retry mechanism handles them (matches the plan's "let retries handle transient failures" design).
+- `app/Jobs/ScanUploadedFile.php` — completed (was mid-edit with `// TODO`s): reads the file from the `local` disk (was checking the wrong disk — hardcoded `'public'`), scans it, `isFound()` → calls `FileDeletionService::delete($id, 'infected', 'local')`, `isOk()` → `scan_status='clean'` + `scanned_at`, otherwise → `scan_status='error'`. Added `failed(Throwable $exception)` so exhausted retries also land on `scan_status='error'` rather than leaving the row silently stuck on `'pending'` forever.
+- `docker-compose.yml` — fixed `queue-worker`'s command to `queue:work database --queue=scans,default` — it was only listening to the `default` queue, so `ScanUploadedFile::dispatch(...)->onQueue('scans')` (already in `FileUploadController`) was being silently queued and never picked up in the real running stack. Confirmed this was a real bug empirically (see verification below), not just a theoretical gap.
+- `tests/Feature/ScanUploadedFileTest.php` — 6 tests against a mocked `VirusScanService`/`FileDeletionService`: clean, infected (asserts the exact `delete($id, 'infected', 'local')` call), clamd-reported error, missing DB record, missing on-disk file, and `failed()` after exhausted retries.
+- `tests/Feature/VirusScanServiceIntegrationTest.php` — 2 tests against the **real** running `clamav` container (no mocking): a clean payload → `isOk()`; the actual EICAR test string → `isFound()` with `Eicar-Test-Signature` in the reason.
+
+**Verification:**
+- `php artisan test` — full suite green, 17 passed (50 assertions).
+- Real end-to-end smoke test against the live stack (not the sqlite testing DB): created two real `File` rows + physically stored content on the `local` disk, dispatched `ScanUploadedFile` onto the real `database` queue with `->onQueue('scans')`, and checked the result after the real `queue-worker` container processed them.
+  - First attempt: nothing happened — the jobs sat in the `jobs` table with `attempts=0` past their `available_at` time. Root cause: `docker compose restart queue-worker` restarts the *existing* container (keeping its original startup command baked in at creation), it does **not** pick up a changed `command:` from `docker-compose.yml` — needed `docker compose up -d --force-recreate queue-worker` instead. Worth remembering for any future `command:` change to a service.
+  - After recreating: the clean file → `scan_status=clean`. The EICAR file → physically deleted from `storage/app/private/uploads/` and `deletion_reason=infected` — confirming `FileDeletionService` (the user's file) really is missing the soft-delete call: `trashed()` was still `false` and `scan_status` still read `'pending'` on that row, even though the physical file was gone and the reason was set. Cleaned up both test rows afterward (`forceDelete`).
+
+**Bugs found and flagged (not fixed — `FileDeletionService`/`AMPQService` are the user's files, per the prior work-split agreement, and this step's permission was scoped to the ClamAV/ScanUploadedFile pieces):**
+1. `FileDeletionService::delete()` never calls `$file->delete()` — physically deletes the file and sets `deletion_reason`, but the row is never actually soft-deleted.
+2. Its AMQP-publish call is placed after an early `return` inside the "file exists on disk" branch — unreachable in the normal case (the notification would never actually fire for a real deletion).
+3. `AMPQService::$connection` is a typed property that's never initialized anywhere before use — would throw on first real use.
+
+**Status:** M1.5's ClamAV client, `ScanUploadedFile`, and its tests are complete and verified against both mocks and the real running clamd. The infected-file path is confirmed working for physical deletion and reason-tagging, but not yet for soft-delete/notification, pending the user's own fixes to `FileDeletionService`/`AMPQService`.
+
+---
+
+## 2026-09-16 — Re-verified FileDeletionService after the user's fix (and an unrelated boot-time slowdown detour)
+
+**User request:** "Modified FileDeletionService, run your check again."
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`).
+
+**What changed:** `FileDeletionService::delete()` now calls `$file->deleteWithReason($reason)` instead of just `$file->save()`; the AMQP-publish call moved outside the `if (Storage::disk($disk)->exists(...))` block, so it's no longer dead code. New `File::deleteWithReason(string $reason)` method: sets `deletion_reason`, saves, then calls `$this->delete()` (soft delete).
+
+**Detour: `php artisan test` took 82s instead of the usual ~14s (individual tests 5-10x slower).** Investigated since a 6x slowdown seemed worth understanding before trusting "tests pass" as a clean signal:
+- Confirmed it wasn't test-specific — even `php artisan --version` and `route:list` (trivial commands) took ~20-23s, up from ~1-3s earlier in the session.
+- Ruled out: `docker exec` overhead itself (plain `echo` ~1.4s), raw PHP startup (~1.1s), Composer autoload (~3.3s), stale `bootstrap/cache/*.php` (cleared via `optimize:clear` — no improvement), CPU/memory contention (`docker stats` showed plenty of headroom on all containers; RabbitMQ's one transient 105% CPU reading had already settled to ~2% on recheck).
+- Profiled Laravel's own boot phases directly: `vendor/autoload.php` (2.1s) + `bootstrap/app.php` (1.3s) + making the console kernel (0.7s) were all normal — but `$kernel->handle()` (which boots every service provider before running the command) took **17s** on its own for a command as trivial as `--version`.
+- Found the likely majority cause: `laravel/boost` (a dev-dependency the user added, gives AI assistants MCP introspection into the app) registers itself eagerly whenever `config('app.debug')` is true or the environment is `local` — which is always true here. Setting `BOOST_ENABLED=false` brought `--version` down from ~23s to ~12.5s. Did **not** fully explain the remaining ~12s, and I stopped digging further at that point rather than continuing to rabbit-hole on a performance question that doesn't block correctness — flagging it here for the user's awareness rather than resolving it unilaterally, since `laravel/boost` is their addition and disabling/tuning it is their call.
+
+**Re-verification (the actual ask):**
+- `php artisan test` — full suite still green, 17/17 passing (just slower, per the detour above).
+- Live end-to-end check against the real running stack (not the sqlite test DB): created a real `File` row with EICAR-string content actually on the `local` disk, called `app(FileDeletionService::class)->delete($id, 'infected', 'local')` directly.
+  - **Soft-delete now works:** `trashed()=true`, `deleted_at` set to a real timestamp, physical file confirmed gone from `storage/app/private/uploads/`. This fixes the bug from the previous check.
+  - **AMQP publish is now reachable** (confirmed via `storage/logs/laravel.log`) — but it immediately throws: `Typed property App\Services\AMPQService::$connection must not be accessed before initialization`. This is the same `AMPQService` bug flagged last time, still present — nothing in `AMPQService` or its `AppServiceProvider` singleton registration ever actually constructs an `AMQPStreamConnection` and assigns it to `$connection`. The exception is caught by `delete()`'s own try/catch, logged, and `delete()` returns `false` — but by that point the soft-delete and physical-delete had already completed successfully, so file cleanup itself is unaffected; only the notification silently fails every time.
+  - Cleaned up the test rows afterward (`forceDelete`).
+
+**Status:** `FileDeletionService`'s soft-delete fix is confirmed correct and complete. The one remaining blocker for the full M4/M5 deletion→notification pipeline to work is `AMPQService::$connection` never being initialized — that's the next thing standing between "file gets deleted" and "RabbitMQ notification actually fires."
+
+---
+
+## 2026-09-16 — AMPQService deferred to M5, targeted re-verification
+
+**User request:** Leave `AMPQService` for M5 (per the original milestone plan — matches `IMPLEMENTATION.md`'s M5 scope, not M1.5). User commented out the `$service = app(AMPQService::class); $service->publishMessage();` lines in `FileDeletionService::delete()` themselves (`// TODO AMPQService`). Asked to continue with `ScanUploadedFile` job & tests, and to rerun only the previously-broken part rather than the full suite (the full suite is currently slow — see the boot-time-slowdown detour logged above, still unresolved but non-blocking).
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`).
+
+**Note:** `ScanUploadedFile`'s job and its tests were already fully built and passing in the prior session turn ("M1.5: ClamAV client package, ScanUploadedFile, tests") — nothing new was needed there. This turn was specifically about re-verifying the `FileDeletionService` fix now that the `AMPQService` call is commented out, using targeted reruns rather than the full suite.
+
+**Verification (targeted, not full suite):**
+- `php artisan test --filter=ScanUploadedFileTest` — 6/6 passing (mocked-collaborator tests, unaffected either way since they mock `FileDeletionService` entirely, but confirmed clean regardless).
+- Direct live check against the real stack: created a real `File` row with EICAR content on the `local` disk, called `app(FileDeletionService::class)->delete($id, 'infected', 'local')` directly. `delete()` now returns `true` (previously `false`, due to the uncaught-until-caught `AMPQService` exception), row is soft-deleted (`trashed()=true`), file physically removed from disk, no error logged. Cleaned up the test row afterward.
+
+**Status:** `FileDeletionService`'s infected-file path is now fully clean end-to-end (soft-delete + physical delete + no errors) with AMQP correctly deferred. Awaiting direction on what's next — `ScanUploadedFile`/tests were already complete before this turn, so no new work was needed there specifically.

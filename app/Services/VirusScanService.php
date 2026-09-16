@@ -2,47 +2,38 @@
 
 namespace App\Services;
 
-use App\Models\File;
-use Illuminate\Http\UploadedFile;
-use Illuminate\Support\Facades\Log;
+use Socket\Raw\Factory;
+use Xenolope\Quahog\Client;
+use Xenolope\Quahog\Result;
 
 class VirusScanService
 {
-    protected string $clamdHost;
-    protected int $clamdPort;
+    protected string $host;
+
+    protected int $port;
+
+    protected int $timeout;
 
     public function __construct()
     {
-        $this->clamdHost = config('services.clamav.host', '127.0.0.1');
-        $this->clamdPort = config('services.clamav.port', 3310);
+        $this->host = config('services.clamav.host');
+        $this->port = config('services.clamav.port');
+        $this->timeout = config('services.clamav.timeout');
     }
 
-    public function scan(UploadedFile $file): bool
+    /**
+     * Scan raw file contents via clamd's INSTREAM protocol.
+     *
+     * Connection failures are allowed to throw so the caller (a queued job)
+     * retries through Laravel's normal job-retry mechanism rather than being
+     * silently swallowed here.
+     */
+    public function scanStream(string $contents): Result
     {
-        $socket = @fsockopen(
-            $this->clamdHost,
-            $this->clamdPort,
-            $errno,
-            $errstr,
-            5
-        );
+        $socket = (new Factory)->createClient("tcp://{$this->host}:{$this->port}", $this->timeout);
 
-        if (!$socket) {
-            Log::error('ClamAV unavailable', ['error' => $errstr]);
-            // TODO Fail closed: reschedule scan
-            return false;
-        }
+        $client = new Client($socket, $this->timeout, PHP_NORMAL_READ);
 
-        $fileContent = file_get_contents($file->getRealPath());
-        $length = strlen($fileContent);
-
-        fwrite($socket, "nINSTREAM\n");
-        fwrite($socket, pack('N', $length) . $fileContent);
-        fwrite($socket, pack('N', 0));
-
-        $response = trim(fgets($socket));
-        fclose($socket);
-
-        return str_contains($response, 'OK');
+        return $client->scanStream($contents);
     }
 }

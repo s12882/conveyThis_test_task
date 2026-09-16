@@ -81,7 +81,7 @@ services:
       context: .
       dockerfile: docker/php/Dockerfile
     container_name: conveythis-queue-worker
-    command: php artisan queue:work database --tries=3 --sleep=3
+    command: php artisan queue:work database --queue=scans,default --tries=3 --sleep=3
     volumes:
       - .:/var/www/html
     env_file: .env

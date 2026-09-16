@@ -37,4 +37,12 @@ class File extends Model
             'size_bytes' => 'integer',
         ];
     }
+
+    public function deleteWithReason(string $reason): ?bool
+    {
+        $this->deletion_reason = $reason;
+        $this->save();
+
+        return $this->delete();
+    }
 }

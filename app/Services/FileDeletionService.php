@@ -14,16 +14,15 @@ class FileDeletionService
         try {
             /** @var File $file */
             $file = File::find($id);
-            $file->deletion_reason = $reason;
-            $file->save();
+            $file->deleteWithReason($reason);
 
             if (Storage::disk($disk)->exists($file->stored_path)) {
-                return Storage::disk($disk)->delete($file->stored_path);
+                Storage::disk($disk)->delete($file->stored_path);
             }
 
-            //TODO publish AMQP message
-            $service = app(AMPQService::class);
-            $service->publishMessage();
+//            TODO AMPQService
+//            $service = app(AMPQService::class);
+//            $service->publishMessage();
 
             return true;
         } catch (Throwable $e) {
