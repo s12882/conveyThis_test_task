@@ -41,4 +41,12 @@ return [
         'timeout' => env('CLAMAV_TIMEOUT', 30),
     ],
 
+    'rabbitmq' => [
+        'host' => env('RABBITMQ_HOST', 'rabbitmq'),
+        'port' => env('RABBITMQ_PORT', 5672),
+        'user' => env('RABBITMQ_USER', 'guest'),
+        'password' => env('RABBITMQ_PASSWORD', 'guest'),
+        'file_deletions_queue' => env('RABBITMQ_FILE_DELETIONS_QUEUE', 'file_deletions'),
+    ],
+
 ];

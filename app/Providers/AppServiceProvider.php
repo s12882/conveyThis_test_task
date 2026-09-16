@@ -2,7 +2,6 @@
 
 namespace App\Providers;
 
-use App\Services\AMPQService;
 use Illuminate\Support\ServiceProvider;
 
 class AppServiceProvider extends ServiceProvider
@@ -12,9 +11,7 @@ class AppServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
-        $this->app->singleton(AMPQService::class, function ($app) {
-            return new AMPQService();
-        });
+        //
     }
 
     /**

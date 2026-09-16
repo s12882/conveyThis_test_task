@@ -20,9 +20,13 @@ class FileDeletionService
                 Storage::disk($disk)->delete($file->stored_path);
             }
 
-//            TODO AMPQService
-//            $service = app(AMPQService::class);
-//            $service->publishMessage();
+            app(AMPQService::class)->publishFileDeletion([
+                'file_id' => $file->id,
+                'original_name' => $file->original_name,
+                'size_bytes' => $file->size_bytes,
+                'deletion_reason' => $reason,
+                'deleted_at' => now()->toIso8601String(),
+            ]);
 
             return true;
         } catch (Throwable $e) {

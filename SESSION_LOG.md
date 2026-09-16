@@ -417,3 +417,32 @@ Presented both with concrete evidence, asked how to handle — user chose to fix
 Added `tests/Feature/FileControllerTest.php` (5 tests: index reflects DB state, invalid params don't error, sorting reorders correctly, destroy soft-deletes + removes the file, destroy on an already-deleted file 404s — one test itself had a backwards assertion caught by its own failure message and fixed). Full Feature suite: 22/22 passing.
 
 **Status:** M3 complete and verified, including the sorting feature from the earlier plan expansion. M2+M3 (the whole frontend plan) are now done. Remaining milestones: M4 (TTL safety-net reaper — `FileDeletionService`/`DeleteExpiredFile` already done per the checklist), M5 (RabbitMQ — `AMPQService`'s uninitialized-connection bug still open, a `FileDeletedNotification` scaffold already exists per the user's own progress), M6 (polish).
+
+---
+
+## 2026-09-16 — M4 reaper + AMPQService fixed (investigated the uninitialized-property error)
+
+**User request:** Go ahead with M4, close remaining TODOs, finish `AMPQService`, and investigate the `Typed property App\Services\AMPQService::$connection must not be accessed before initialization` error specifically.
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`).
+
+**Investigated the error before fixing anything:** `AMPQService::$connection` was declared `protected AMQPStreamConnection $connection;` — a typed property with no default value and no constructor to assign it. PHP's typed properties have no implicit default (unlike untyped ones, which default to `null`); they start "uninitialized," and reading an uninitialized typed property throws exactly this `Error`. Confirmed nothing in the class or its container registration ever did `$this->connection = new AMQPStreamConnection(...)` — the property was simply never set before `establishConnection()` tried to call `$this->connection->channel()`.
+
+**Fixed `AMPQService`:**
+- Added a constructor that actually builds the `AMQPStreamConnection` from new `config('services.rabbitmq.*')` entries (host/port/user/password/`file_deletions_queue` — all backed by `.env` vars that already existed from the M0 Docker setup).
+- **Found a second, less obvious bug while fixing the first**: `AppServiceProvider` registered `AMPQService` as a `singleton`. Since `publishFileDeletion()` closes its channel+connection at the end of every call, a singleton would have a dead connection after its first use — and the `queue-worker` container is a long-running process that handles many jobs without restarting, so any deletion after the first (within that process's lifetime) would hit a closed connection. Removed the singleton registration entirely (deleted the whole `register()` body in `AppServiceProvider`); `AMPQService` has no unresolvable constructor args, so Laravel's container auto-resolves a fresh instance — and fresh connection — every time, which is exactly right given the open-then-close-per-call design.
+- Replaced the hardcoded `'my_exchange'`/`'my_routing_key'`/`'my_queue'` placeholders (the two remaining `// TODO set values from app` comments) and the empty `{'status':'success'}` body with a real `publishFileDeletion(array $payload)` method, publishing straight to the `file_deletions` queue via RabbitMQ's default (nameless) exchange — the simplest correct pattern for a single producer/single queue, no custom exchange needed.
+- Re-enabled `FileDeletionService::delete()`'s commented-out AMQP call (closed the `// TODO AMPQService` comment), now building a real payload (`file_id`, `original_name`, `size_bytes`, `deletion_reason`, `deleted_at`) instead of the placeholder.
+
+**Verification:**
+- Manual: `(new AMPQService())->publishFileDeletion([...])` via tinker → confirmed via RabbitMQ's management API (`GET /api/queues/%2f/file_deletions`) that the message actually landed, then consumed it via the management API's `get` endpoint and confirmed the exact JSON payload and `delivery_mode: 2` (persistent).
+- Ran `FileDeletionService::delete()` end-to-end against a real `File` row — `delete()` returned `true`, row soft-deleted, physical file gone, and a correctly-shaped message appeared on the queue.
+- Added `tests/Feature/AMPQServiceIntegrationTest.php` (mirrors `VirusScanServiceIntegrationTest`'s pattern exactly): purges the queue, publishes, consumes it back via a fresh `AMQPStreamConnection`, asserts the exact payload.
+
+**Built M4's remaining piece:** `app/Console/Commands/ReapExpiredFiles.php` (`files:reap-expired` — finds files with `expires_at <= now()` still active, i.e. not yet soft-deleted, since Eloquent's default query already excludes trashed rows; deletes each via `FileDeletionService` with reason `ttl_safety_net`), registered on the scheduler in `routes/console.php` (`Schedule::command('files:reap-expired')->everyFiveMinutes()`). Verified live: created a file with `expires_at` in the past (simulating a lost delayed job), ran the command, confirmed it was correctly soft-deleted, physically removed, tagged `ttl_safety_net`, and triggered the AMQP publish. Added `tests/Feature/ReapExpiredFilesTest.php` (3 tests: reaps an orphaned expired file, leaves not-yet-expired files alone, leaves already-deleted expired files alone).
+
+**TODOs closed:** swept `app/`, `routes/`, `config/`, `resources/views/`, `resources/js/`, `tests/` for `TODO` — none remain. (Noted but intentionally left untouched: `App\Notifications\FileDeletedNotification`, the user's own in-progress M5 scaffold, has an unassigned `$fileData` property and assumes `$notifiable->name` exists — flagged in `IMPLEMENTATION.md` for when that gets wired up, not part of what was asked this turn.)
+
+**Verification:** full Feature suite — 26/26 passing (up from 22; +1 AMPQ integration test, +3 reaper tests).
+
+**Status:** M4 complete. M5's publisher half (`AMPQService`) is now fully working; the consumer command (`rabbitmq:consume-file-deletions`) and wiring up `FileDeletedNotification` remain, along with fixing that notification class's own bugs, whenever the user wants to continue into the rest of M5.

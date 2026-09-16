@@ -152,17 +152,28 @@ All four confirmed via real end-to-end HTTP (not just PHPUnit): upload → appea
 
 **M4 — Shared deletion path + TTL**
 - [x] `FileDeletionService`: delete physical file, soft-delete row with `deletion_reason` (`manual`/`ttl_expired`/`ttl_safety_net`/`infected`)
-- [ ] Publish AMQP message
+- [x] Publish AMQP message — see AMPQService fix below
 - [x] `DeleteExpiredFile` job (consumes the database queue) calling the service with `ttl_expired`
-- [ ] `files:reap-expired` Artisan command + schedule entry (safety net), reason `ttl_safety_net`
-- [ ] Tests: job execution deletes file; reaper catches an "orphaned" expired row
+- [x] `files:reap-expired` Artisan command + schedule entry (safety net), reason `ttl_safety_net` — `app/Console/Commands/ReapExpiredFiles.php`, `Schedule::command('files:reap-expired')->everyFiveMinutes()` in `routes/console.php`
+- [x] Tests: `tests/Feature/ReapExpiredFilesTest.php` (3 tests: reaps an orphaned expired file, ignores not-yet-expired files, ignores already-deleted expired files)
+
+**M4 done (2026-09-16).** Verified live: created a file with `expires_at` in the past (simulating a delayed job that never fired), ran `php artisan files:reap-expired` — correctly soft-deleted it, removed the physical file, set `deletion_reason=ttl_safety_net`, and published the AMQP deletion event.
 
 **M5 — RabbitMQ notification**
-- [x] Scaffold `FileDeletedNotification`
-- [ ] `php-amqplib` integration: publisher (inside `FileDeletionService`) + queue/exchange declaration
+- [x] Scaffold `FileDeletedNotification` (user's own work in progress — not touched this session; has a couple of bugs worth knowing about before it's wired up: `$fileData` is declared but never assigned in the constructor, and `toMail()` assumes `$notifiable->name` exists, which won't hold for a plain-email `Notification::route('mail', ...)` recipient)
+- [x] `php-amqplib` integration: publisher (`AMPQService::publishFileDeletion()`, called from `FileDeletionService::delete()`) + queue declaration (see AMPQService fix below — no custom exchange needed, publishes straight to the `file_deletions` queue via RabbitMQ's default exchange)
 - [ ] `rabbitmq:consume-file-deletions` Artisan command: consumes messages, sends `FileDeletedNotification` Mailable to `FILE_DELETION_NOTIFICATION_EMAIL`
-- [ ] `MAIL_MAILER=log` config
-- [ ] Tests: publisher enqueues expected payload (mock channel); consumer command sends mail for a given message (`Mail::fake()`)
+- [ ] `MAIL_MAILER=log` config (already the Laravel default in this project, per M0 — nothing to change when this is built)
+- [x] Tests: `tests/Feature/AMPQServiceIntegrationTest.php` — publishes against the **real** RabbitMQ (mirrors the ClamAV integration-test pattern), consumes it back, asserts the exact payload. Consumer command's own tests still pending (not built yet).
+
+**AMPQService fixed (2026-09-16).** The user asked me to investigate `Typed property App\Services\AMPQService::$connection must not be accessed before initialization` and finish the class. Root cause and fix:
+- `$connection` was declared `protected AMQPStreamConnection $connection;` with no default and no constructor — PHP's typed properties are "uninitialized" (not null, not any default) until explicitly assigned, and reading an uninitialized typed property throws exactly this `Error`. Nothing in the class ever did `$this->connection = new AMQPStreamConnection(...)`. Fixed by constructing the connection in `__construct()`, using new `config('services.rabbitmq.*')` entries (host/port/user/password/`file_deletions_queue`, all already backed by the `.env` vars from M0).
+- **Second, less obvious bug found while fixing the first**: `AppServiceProvider` registered `AMPQService` as a `singleton`. Since `publishFileDeletion()` closes its channel and connection at the end of every call, a *singleton* instance would have its connection closed after the first publish — then get reused (with a dead connection) by the next deletion within the same long-running process (the `queue-worker` container handles many jobs over its lifetime without restarting). Removed the singleton registration entirely; `AMPQService` has no unresolvable constructor dependencies, so Laravel auto-resolves a fresh instance (and fresh connection) on every `app(AMPQService::class)` call — exactly what's needed given the open-then-close-per-publish design.
+- Replaced the hardcoded `'my_exchange'`/`'my_routing_key'`/`'my_queue'` placeholders and empty `publishMessage()` body with `publishFileDeletion(array $payload)`, publishing straight to the `file_deletions` queue (RabbitMQ's default nameless exchange, routing key = queue name — the simplest correct pattern for one producer/one queue, no custom exchange needed).
+- `FileDeletionService::delete()`'s commented-out AMQP call re-enabled, now building a real payload (`file_id`, `original_name`, `size_bytes`, `deletion_reason`, `deleted_at`) instead of the old hardcoded `{'status':'success'}`.
+- Verified via RabbitMQ's management API (manual publish + inspect) and via `AMPQServiceIntegrationTest` (automated): message lands on `file_deletions` with exactly the expected JSON payload, `delivery_mode: 2` (persistent).
+
+Full Feature suite: 26/26 passing.
 
 **M6 — Polish**
 - [ ] End-to-end manual verification via `docker compose up`

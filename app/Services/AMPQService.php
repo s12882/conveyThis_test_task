@@ -2,46 +2,45 @@
 
 namespace App\Services;
 
-use Illuminate\Support\Facades\Log;
-use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Connection\AMQPStreamConnection;
 use PhpAmqpLib\Message\AMQPMessage;
 
 class AMPQService
 {
-    protected AMQPStreamConnection $connection;
+    private AMQPStreamConnection $connection;
 
-    protected AMQPChannel $channel;
-
-    public function publishMessage(): void
+    public function __construct()
     {
-        $this->establishConnection();
+        $this->connection = new AMQPStreamConnection(
+            config('services.rabbitmq.host'),
+            config('services.rabbitmq.port'),
+            config('services.rabbitmq.user'),
+            config('services.rabbitmq.password'),
+        );
+    }
 
-        $msg = new AMQPMessage(
-            json_encode(['status' => 'success']),
+    /**
+     * Publish a file-deletion event, picked up by the rabbitmq-consumer
+     * command (M5) to send the deletion-notification email.
+     */
+    public function publishFileDeletion(array $payload): void
+    {
+        $queue = config('services.rabbitmq.file_deletions_queue');
+
+        $channel = $this->connection->channel();
+        $channel->queue_declare($queue, false, true, false, false);
+
+        $message = new AMQPMessage(
+            json_encode($payload),
             ['delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT]
         );
 
-        $this->channel->basic_publish($msg, 'my_exchange', 'my_routing_key'); // TODO set values from app
+        // Publish straight to the queue via RabbitMQ's default (nameless)
+        // exchange — routing_key = queue name. No custom exchange needed
+        // for a single producer/single queue setup like this one.
+        $channel->basic_publish($message, '', $queue);
 
-        $this->closeConnection();
-    }
-
-    protected function establishConnection(): void
-    {
-        $this->channel = $this->connection->channel();
-        $this->channel->exchange_declare('my_exchange', 'direct', false, true, false);
-        $this->channel->queue_declare('my_queue', false, true, false, false);
-        $this->channel->queue_bind('my_queue', 'my_exchange', 'my_routing_key'); // TODO set values from app
-    }
-
-    protected function closeConnection(): void
-    {
-        $this->channel->close();
-        try {
-            $this->connection->close();
-        } catch (\Exception $e) {
-            Log::error($e->getMessage());
-        }
+        $channel->close();
+        $this->connection->close();
     }
 }
