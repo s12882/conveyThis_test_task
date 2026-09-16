@@ -16,9 +16,9 @@ class FileDeletedNotification extends Notification
     /**
      * Create a new notification instance.
      */
-    public function __construct()
+    public function __construct(array $fileData)
     {
-        //
+        $this->fileData = $fileData;
     }
 
     /**
