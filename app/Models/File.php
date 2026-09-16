@@ -12,6 +12,7 @@ use Illuminate\Database\Eloquent\SoftDeletes;
  * @property string original_name
  * @property string stored_path
  * @property string deletion_reason
+ * @property string size_bytes
  */
 class File extends Model
 {

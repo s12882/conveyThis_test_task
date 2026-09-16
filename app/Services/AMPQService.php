@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use Illuminate\Support\Facades\Log;
 use PhpAmqpLib\Connection\AMQPStreamConnection;
 use PhpAmqpLib\Message\AMQPMessage;
 
@@ -11,12 +12,16 @@ class AMPQService
 
     public function __construct()
     {
-        $this->connection = new AMQPStreamConnection(
-            config('services.rabbitmq.host'),
-            config('services.rabbitmq.port'),
-            config('services.rabbitmq.user'),
-            config('services.rabbitmq.password'),
-        );
+        try {
+            $this->connection = new AMQPStreamConnection(
+                config('services.rabbitmq.host'),
+                config('services.rabbitmq.port'),
+                config('services.rabbitmq.user'),
+                config('services.rabbitmq.password'),
+            );
+        } catch (\Exception $e) {
+            Log::error('Error establishing AMPQ stream: '. $e->getMessage());
+        }
     }
 
     /**
@@ -41,6 +46,10 @@ class AMPQService
         $channel->basic_publish($message, '', $queue);
 
         $channel->close();
-        $this->connection->close();
+        try {
+            $this->connection->close();
+        } catch (\Exception $e) {
+            Log::error('Error closing AMPQ connection: '.$e->getMessage());
+        }
     }
 }
