@@ -38,11 +38,11 @@ class FileDeletedNotification extends Notification
     {
         return (new MailMessage)
             ->subject('Файл был удален: ' . $this->fileData['original_name'])
-            ->greeting('Здравствуйте, ' . $notifiable->name . '!')
+            ->greeting('Здравствуйте!')
             ->line('Обратите внимание, что файл **' . $this->fileData['original_name'] . '** был безвозвратно удален из вашего хранилища.')
             ->line('Размер файла: ' . $this->fileData['size_bytes'] / 1024)
             ->line('Дата удаления: ' . now()->toDateTimeString())
-            ->action('Перейти в хранилище', url('/storage'));
+            ->action('Перейти в хранилище', route('files.index'));
     }
 
     /**

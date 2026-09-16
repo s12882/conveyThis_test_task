@@ -92,6 +92,20 @@ services:
         condition: service_healthy
     networks: [conveythis]
 
+  rabbitmq-consumer:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    container_name: conveythis-rabbitmq-consumer
+    command: php artisan rabbitmq:consume-file-deletions
+    volumes:
+      - .:/var/www/html
+    env_file: .env
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks: [conveythis]
+
   scheduler:
     build:
       context: .

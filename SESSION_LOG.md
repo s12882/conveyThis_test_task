@@ -446,3 +446,33 @@ Added `tests/Feature/FileControllerTest.php` (5 tests: index reflects DB state, 
 **Verification:** full Feature suite — 26/26 passing (up from 22; +1 AMPQ integration test, +3 reaper tests).
 
 **Status:** M4 complete. M5's publisher half (`AMPQService`) is now fully working; the consumer command (`rabbitmq:consume-file-deletions`) and wiring up `FileDeletedNotification` remain, along with fixing that notification class's own bugs, whenever the user wants to continue into the rest of M5.
+
+---
+
+## 2026-09-16 — M5: consumer command built, full pipeline complete
+
+**User request:** Continue with M5, build the consumer command.
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`).
+
+**Noted the user's own concurrent progress before starting:** `File.php` gained a (harmless, cosmetic) `@property string size_bytes` docblock annotation — inconsistent with the actual `integer` cast but doesn't affect runtime, left alone. `AMPQService` had been wrapped in try/catch around the connection construction and close — flagged one residual risk: if `AMQPStreamConnection` construction itself fails inside that try/catch, `$connection` stays uninitialized (caught, logged, swallowed) and the *next* line that touches it would throw the exact same "must not be accessed before initialization" error again, just resurfacing later with a less informative message. Mentioned for awareness, not blocking, since it's a narrow edge case (RabbitMQ unreachable at construction time) — did not change it.
+
+**Fixed `FileDeletedNotification`'s two remaining bugs** (minimal, necessary fixes to make it actually usable by the consumer — content/wording left untouched): `$notifiable->name` in the greeting doesn't exist on the plain-email `Notification::route('mail', ...)` recipient this app uses (no auth/users, decision 1) — replaced with a name-independent greeting. The action button linked to a nonexistent `/storage` route — pointed at `route('files.index')` instead.
+
+**Built:**
+- `config/files.php` gained `notification_email` (backed by the existing `FILE_DELETION_NOTIFICATION_EMAIL`).
+- `app/Console/Commands/ConsumeFileDeletions.php` (`rabbitmq:consume-file-deletions`) — long-running `basic_consume` loop, sends `FileDeletedNotification` per message, always acks (no DLQ configured, so a malformed message is logged and dropped rather than looping forever), `--limit=N` option for testing.
+- `docker-compose.yml` gained the `rabbitmq-consumer` service (deferred back in M0 until this command existed), running the command with no `--limit` for real long-running production use.
+
+**Bug found and fixed during verification — the `--limit` option hung the command entirely.** First test run (`--limit=10` against only 3 queued messages) never returned — `docker compose exec` timed out client-side and moved to background, but the actual `php artisan` process kept running inside the container. Root cause: the loop only checked the limit *after* `$channel->wait()` returned, and `wait()` with no timeout blocks forever waiting for a message that isn't coming. Had to kill the stuck process manually: `docker top` showed a *host-mapped* PID that didn't match what existed inside the container's own PID namespace (`/proc` listing from inside showed the real PID); no `kill`/`ps` binaries in this slim image, so used `posix_kill()` via a `php -r` one-liner instead. Fixed the actual bug by passing a short (`3`s) timeout to `wait()` only when `--limit` is set, catching `AMQPTimeoutException` to exit gracefully — real production use (no `--limit`) still blocks indefinitely as intended.
+
+**Second bug found while running the full test suite** — `AMPQServiceIntegrationTest` (previously passing) and the new consumer test both failed intermittently. Root cause: the long-running `rabbitmq-consumer` container I'd started for manual verification was still up, and since tests hit the **same real RabbitMQ broker** (no separate test instance), it was racing the tests for messages on `file_deletions` — whichever consumer grabbed a given message first won. Fixed by stopping the container before test runs; documented this as an operational caveat in `IMPLEMENTATION.md` (`queue-worker`/ClamAV tests don't have this problem — `QUEUE_CONNECTION=sync` and a shared non-competing `clamd` respectively).
+
+**Verification (all real infrastructure, not just mocks):**
+- Manual: published via tinker, ran the command with `--limit=1`, confirmed the exact notification content in `storage/logs/laravel.log` (correct recipient, subject, size, date, and the fixed `/files` link).
+- **Full live pipeline**: uploaded and deleted a real file through the actual running app (curl, AJAX-shaped request) while the long-running `rabbitmq-consumer` container was up — it automatically picked up and processed the deletion with zero manual intervention, exactly how it'll run in practice.
+- Added `tests/Feature/ConsumeFileDeletionsTest.php` (2 tests: sends a notification for a published event via `Notification::fake()`/`assertSentOnDemand`, exits gracefully with nothing waiting). Full Feature suite (with the consumer stopped first): 28/28 passing.
+
+**Flagged, not fixed (pre-existing, unrelated to this session's work):** `FILE_DELETION_NOTIFICATION_EMAIL` is still the M0 placeholder (`notify@example.com`) — the pipeline now genuinely sends (logged) notifications there, so it's worth setting to a real address.
+
+**Status:** M5 complete — the full pipeline (upload → scan/manual-delete/TTL-expiry → `FileDeletionService` → AMQP → `rabbitmq-consumer` → logged email) works end-to-end, verified live. `rabbitmq-consumer` left running. Remaining: M6 polish (README, end-to-end docs, edge-case hardening) is the only milestone left per `IMPLEMENTATION.md`.
