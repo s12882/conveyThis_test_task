@@ -29,7 +29,7 @@ class StoreFileRequest extends FormRequest
                 'required',
                 'file',
                 'min:1',
-                'max:10240',
+                'max:'.config('files.max_size_kb'),
                 'mimetypes:application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document',
                 new ValidFilenameEncoding,
                 new ValidDocumentIntegrity,
@@ -39,10 +39,11 @@ class StoreFileRequest extends FormRequest
 
     public function messages(): array
     {
+        $maxMb = (int) (config('files.max_size_kb') / 1024);
+
         return [
-            'file.mimes'    => 'Only PDF & DOCX files are allowed.',
-            'file.max'      => 'File size must not exceed 10 MB.', // TODO: Replace with config later
-            'file.mimetypes'=> 'The file type does not match the expected MIME type.',
+            'file.max' => "File size must not exceed {$maxMb} MB.",
+            'file.mimetypes' => 'The file type does not match the expected MIME type.',
         ];
     }
 }

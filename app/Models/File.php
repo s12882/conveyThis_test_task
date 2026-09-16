@@ -34,7 +34,7 @@ class File extends Model
         return [
             'expires_at' => 'datetime',
             'scanned_at' => 'datetime',
-            'size_bytes' => 'integer',
+            'size_bytes' => 'integer'
         ];
     }
 

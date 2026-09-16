@@ -314,3 +314,80 @@ Updated as we go; most recent entries at the bottom.
 - Direct live check against the real stack: created a real `File` row with EICAR content on the `local` disk, called `app(FileDeletionService::class)->delete($id, 'infected', 'local')` directly. `delete()` now returns `true` (previously `false`, due to the uncaught-until-caught `AMPQService` exception), row is soft-deleted (`trashed()=true`), file physically removed from disk, no error logged. Cleaned up the test row afterward.
 
 **Status:** `FileDeletionService`'s infected-file path is now fully clean end-to-end (soft-delete + physical delete + no errors) with AMQP correctly deferred. Awaiting direction on what's next — `ScanUploadedFile`/tests were already complete before this turn, so no new work was needed there specifically.
+
+---
+
+## 2026-09-16 — Frontend plan (M2 + M3), plan mode
+
+**User request (plan mode):** Move on to frontend M2/M3. Use a Laravel layout & partials system for UI consistency; expand the plan to include creating a layout and shared button components.
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`).
+
+**Context gathered:** re-read the current `routes/web.php`, `FileUploadController.php` (confirmed `destroy()` already exists and works, calling `FileDeletionService`), `welcome.blade.php` (still the M0 placeholder), and confirmed `resources/views/` has nothing else yet (no layouts/components/partials dirs) — clean slate for this work.
+
+**Branching decisions, resolved via `AskUserQuestion`:**
+1. Controller organization → new `FileController` (`index()`+`destroy()`, moved off `FileUploadController`) over keeping everything on one controller.
+2. Delete confirmation → Bootstrap modal over native `confirm()`.
+3. File list → paginated (15/page) over showing everything unpaginated.
+
+**Plan written and approved:** `~/.claude/plans/before-starting-implementation-i-nested-lerdorf.md` (overwrote the prior, unrelated ClamAV-analysis plan in this same file, per plan-mode's "different task" rule). Covers: a `layouts/app.blade.php` + `partials/navbar.blade.php` + `partials/alerts.blade.php` layout system; `<x-button>`/`<x-badge>` Blade components; route changes (`GET /` → upload page, new `GET /files` → list page, `destroy()` re-homed); M2's upload-page design (client-side pre-checks, AJAX + progress bar); M3's list-page design (paginated table, modal-confirmed AJAX delete); test scope; full file list to create/change/delete.
+
+**Status:** Plan approved, folded into `IMPLEMENTATION.md`'s M2/M3 sections. Not yet started — need to confirm implementation sequencing (step-by-step vs. one pass) before writing code, matching this project's established cadence.
+
+---
+
+## 2026-09-16 — Layout, partials, and shared components
+
+**User request:** Step-by-step, starting with the app layout & components.
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`).
+
+**Found the user had already moved ahead on the controller-organization decision from the plan** — `FileController` now exists (`index()` returning `view('files.index', compact('files'))`, `destroy()` moved off `FileUploadController`) and `routes/web.php` already wires `GET /files`/`DELETE /files/{file}` to it, exactly matching the agreed decision. No conflict with this step (layout/components don't touch controllers), noted for awareness.
+
+**Built:**
+- `resources/views/layouts/app.blade.php` — master layout, `@yield('title', ...)`/`@yield('content')`, CSRF `<meta>` tag, includes the two partials below.
+- `resources/views/partials/navbar.blade.php` — brand + Upload/Manage Files links with active-state highlighting. Used plain `url('/')`/`url('/files')` rather than named routes, since neither is named yet — will switch to `route()` calls once M2/M3 actually name them, to avoid this step depending on routes that don't exist yet.
+- `resources/views/partials/alerts.blade.php` — renders session `success`/`error` flashes and `$errors` validation messages as dismissible Bootstrap alerts, plus an empty `#ajax-alert-region` div for JS-injected AJAX success/error alerts (needed since upload/delete happen via AJAX with no page reload, so session-flash alerts alone wouldn't show).
+- `resources/views/components/button.blade.php` — `<x-button variant="" size="" type="">`, anonymous Blade component using `@props`/`$attributes->merge()`.
+- `resources/views/components/badge.blade.php` — `<x-badge variant="">`, same pattern, generic (doesn't know about `scan_status` — that color-mapping belongs in the M3 page, not the component).
+
+**Verification:**
+- `php artisan view:cache` — all Blade templates (including the new ones) compile without syntax errors; cleared back afterward (don't want production view caching during active dev).
+- Rendered the components directly via `Blade::render()` in tinker with various props — output matches exactly (correct `btn btn-danger btn-sm` classes, `id` attribute merged in, correct defaults when no props given).
+- The layout itself can't be verified via `view()->render()` in tinker — Laravel's `$errors` variable is normally auto-shared by the `web` middleware group during a real HTTP request, and tinker's direct render bypasses that, so `partials/alerts.blade.php`'s `$errors->any()` call fails outside a real request (expected, not a bug). Verified properly instead via a real HTTP request: added a temporary throwaway route + view (`/_layout_smoke_test`), curled it, confirmed the title/navbar/alerts-region/content-yield/CSRF-meta/nav-links all present in the response, then removed both the temporary route and view, restoring `routes/web.php` to its prior state exactly. Confirmed `GET /` (the existing welcome page) still returns 200 afterward, unaffected.
+
+**Status:** Layout, partials, and shared components done and verified. Next (pending go-ahead): M2, the upload page itself.
+
+---
+
+## 2026-09-16 — Expanded plan: M3 sorting
+
+**User request:** Add sorting to M3 by `created_at`/`expires_at`/`size_bytes`, added to the plan (not implemented yet — this was explicitly a planning/doc update, not a code change).
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`).
+
+**Design added to both the plan file and `IMPLEMENTATION.md`:** `FileController@index` will read `sort`/`direction` query params, validated against a whitelist of the three columns (invalid/missing → silently falls back to the default `created_at`/`desc`, since this is a GET list view rather than a form submission), replacing the current `->latest()` with `->orderBy($sort, $direction)`. Table headers for Uploaded/Expires/Size become sort-toggle links (first click ascending, second click on the same column toggles), with a direction indicator, and both those links and the pagination links preserve the full current query string (`per_page` + sort) so paging through a sorted list doesn't silently reset order.
+
+**Status:** No code changed this turn — plan updated only, per the request. M3 will include sorting when we get to that step.
+
+---
+
+## 2026-09-16 — M2: upload page built (review first, then Blade)
+
+**User request:** Go ahead with M2. User was already working on the controller & request — asked me to review and suggest improvements first, then move on to the Blade files.
+
+**TASK.md check:** hash unchanged (`d6bc2c33...dab9d`).
+
+**Review of `FileUploadController`/`StoreFileRequest`:** ran `FileUploadTest` first to confirm current state was green (7/7). Found: (1) a dead `'file.mimes'` message key in `StoreFileRequest::messages()` — the rule uses `mimetypes`, not `mimes`, so that custom message could never actually fire; (2) the 10MB limit hardcoded in two places (`max:10240` rule, `'File size must not exceed 10 MB.'` message text) — exactly what the file's own `// TODO: Replace with config later` flagged. Presented both, asked how to handle — user chose "fix both now."
+
+**Fixes applied:** `config/files.php` gained `max_size_kb` (backed by new `FILE_MAX_SIZE_KB` env var, default `10240`, added to `.env`/`.env.example`). `StoreFileRequest` now uses `'max:'.config('files.max_size_kb')` for the rule and computes the MB figure in the message from the same config value; removed the dead `file.mimes` key. Re-ran `FileUploadTest` — still 7/7.
+
+**Built the rest of M2** (per the approved plan): `FileUploadController::create()` (renders `files/upload.blade.php`); `routes/web.php` — `GET /` now points at `create()` and is named `upload.create`, `GET /files` named `files.index` (was unnamed) so the navbar partial can use `route()` instead of the placeholder `url()` calls from the layout step; `resources/views/files/upload.blade.php` (file input, client-side pre-check hooks via `data-max-size-bytes`/`data-allowed-extensions` attributes driven by `config('files.max_size_kb')` so the client and server can't drift out of sync, progress bar, `<x-button>`); `resources/js/app.js` rewritten with a global CSRF `$.ajaxSetup`, and an `initUploadForm()` handler (client-side extension/size validation, `FormData` AJAX submit with upload-progress-driven progress bar, success/422/error alert handling via the `#ajax-alert-region` from the layout step). Deleted `resources/views/welcome.blade.php` (superseded).
+
+**Verification:**
+- Rebuilt frontend assets via the established throwaway-node-container pattern (`npm run build` against the bind-mounted host directory).
+- `GET /` → 200; confirmed via `curl`/`grep` that the form, its `data-*` attributes, the `<x-button>` output, and the navbar all render correctly.
+- Real end-to-end AJAX-shaped upload via `curl`: fetched the CSRF token from the rendered page, submitted a real multipart file with `X-CSRF-TOKEN`/`X-Requested-With`/`Accept: application/json` headers (matching what jQuery's AJAX call actually sends) — got a real `201` with the created file's JSON, not just a PHPUnit-simulated request. Cleaned up the test record and physical file afterward — also found and cleaned up two more physical files orphaned on disk from earlier session E2E checks (`e2e-clean.pdf`, `recheck-clean.pdf`) where only the DB row had been force-deleted, not the file itself; a reminder that `forceDelete()` bypasses `FileDeletionService` entirely and never touches storage.
+- Added `tests/Feature/UploadPageTest.php` (per the plan's M2 test scope). Full `--testsuite=Feature` run: 17/17 passing.
+
+**Status:** M2 complete and verified. Next (pending go-ahead): M3, the file management/list page (including the sorting feature added to the plan earlier this session).

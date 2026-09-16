@@ -122,22 +122,35 @@ Verified working (2026-09-15): app reachable via nginx at `http://localhost:8000
 - [x] `ScanUploadedFile` job: streams file to `clamd`; infected → `FileDeletionService::delete($file, reason: 'infected')`; clean → `scan_status='clean'`, `scanned_at=now()`; exhausted retries on scanner error → `scan_status='error'` (never silently default to clean)
 - [x] Tests: mocked-scanner unit tests for clean/infected paths; optional EICAR-string integration test against real `clamd`
 
-**M2 — Upload frontend**
-- [ ] Upload page (Bootstrap layout), jQuery-driven AJAX submit with progress/feedback
-- [ ] Client-side type/size checks mirroring server-side validation
+**M2 — Upload frontend** & **M3 — File management page** (expanded plan, 2026-09-16: `~/.claude/plans/before-starting-implementation-i-nested-lerdorf.md`)
 
-**M3 — File management page**
-- [ ] List page (name, size, uploaded-at, expires-at, `scan_status` badge) via Bootstrap table
-- [ ] Manual delete action (AJAX), wired through `FileDeletionService`
-- [ ] Feature tests: list reflects DB state, delete removes file + row + triggers deletion event
+Decisions: `FileController` (new) owns `index()`+`destroy()` (moved from `FileUploadController`, which stays upload-only with `create()`+`store()`); delete confirmation via a Bootstrap modal, not native `confirm()`; file list paginated (15/page).
+
+View architecture — a Laravel layout+partials system plus shared Blade components, so pages share consistent chrome and reusable pieces aren't copy-pasted:
+- `resources/views/layouts/app.blade.php` — master layout (`@yield('content')`), includes `partials/navbar.blade.php` + `partials/alerts.blade.php`, adds the CSRF `<meta>` tag.
+- `resources/views/components/button.blade.php` and `components/badge.blade.php` — shared, prop-driven (`<x-button variant="" size="">`, `<x-badge variant="">`), used across both pages.
+- `resources/views/files/upload.blade.php` (M2) and `files/index.blade.php` (M3), plus `files/partials/delete-modal.blade.php`.
+- `resources/views/welcome.blade.php` retired.
+
+- [ ] Routes: `GET /` → `FileUploadController@create`; `GET /files` → `FileController@index`; `DELETE /files/{file}` moved to `FileController@destroy`; `POST /files` unchanged (**note:** the user has already hand-built `FileController` with `index()`+`destroy()` and wired `GET /files`/`DELETE /files/{file}` to it in `routes/web.php`, matching this decision — only `GET /` still needs to move from the inline closure to `FileUploadController@create`)
+- [x] Layout + partials + `<x-button>`/`<x-badge>` components — `resources/views/layouts/app.blade.php`, `partials/navbar.blade.php`, `partials/alerts.blade.php`, `components/button.blade.php`, `components/badge.blade.php`. Navbar uses plain `url()` links (not named routes) since `GET /`/`GET /files` aren't named yet — will switch to `route()` once M2/M3 name them.
+- [x] M2 upload page: file input + client-side type/size pre-checks, jQuery AJAX submit (`FormData`) with progress bar, success/error alert handling — `resources/views/files/upload.blade.php`, `FileUploadController::create()`, `GET /` named `upload.create`
+- [ ] M3 file list page: paginated Bootstrap table (name/size/uploaded-at/expires-at/`scan_status` badge), delete via Bootstrap-modal-confirmed AJAX call
+- [ ] M3 sorting (added 2026-09-16): sortable by `created_at`/`expires_at`/`size_bytes` via whitelisted `sort`/`direction` query params (default `created_at`/`desc`, matching current behavior); clickable column headers (first click = ascending, click again = toggle), direction indicator, sort preserved across pagination (`$files->appends(request()->query())`)
+- [x] `resources/js/app.js`: global CSRF `ajaxSetup`, upload-form handler (client-side extension/size pre-check driven by `data-*` attributes from `config('files.max_size_kb')`, progress bar, AJAX alert injection) — delete-modal handler still pending (M3)
+- [x] Tests: `GET /` smoke test — `tests/Feature/UploadPageTest.php`. `FileControllerTest` for `index()`/`destroy()` still pending (M3)
+
+**M2 done (2026-09-16).** Along the way, reviewed `StoreFileRequest` at the user's request and fixed two small issues: a dead `file.mimes` message key (rule is `mimetypes`, not `mimes` — that message could never fire) and the hardcoded `10240`/`"10 MB"` duplication (now both derive from a new `config('files.max_size_kb')`, backed by `FILE_MAX_SIZE_KB` in `.env`). Verified end-to-end via a real AJAX-shaped HTTP request (proper CSRF token + `X-Requested-With`/`Accept` headers, not just PHPUnit) — 201, file stored, DB record created. Full Feature suite: 17/17 passing.
 
 **M4 — Shared deletion path + TTL**
-- [ ] `FileDeletionService`: delete physical file, soft-delete row with `deletion_reason` (`manual`/`ttl_expired`/`ttl_safety_net`/`infected`), publish AMQP message
-- [ ] `DeleteExpiredFile` job (consumes the database queue) calling the service with `ttl_expired`
+- [x] `FileDeletionService`: delete physical file, soft-delete row with `deletion_reason` (`manual`/`ttl_expired`/`ttl_safety_net`/`infected`)
+- [ ] Publish AMQP message
+- [x] `DeleteExpiredFile` job (consumes the database queue) calling the service with `ttl_expired`
 - [ ] `files:reap-expired` Artisan command + schedule entry (safety net), reason `ttl_safety_net`
 - [ ] Tests: job execution deletes file; reaper catches an "orphaned" expired row
 
 **M5 — RabbitMQ notification**
+- [x] Scaffold `FileDeletedNotification`
 - [ ] `php-amqplib` integration: publisher (inside `FileDeletionService`) + queue/exchange declaration
 - [ ] `rabbitmq:consume-file-deletions` Artisan command: consumes messages, sends `FileDeletedNotification` Mailable to `FILE_DELETION_NOTIFICATION_EMAIL`
 - [ ] `MAIL_MAILER=log` config
